@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterable
 
 from ualextractor.inspector.inspection import InspectionResult, InspectionStatus
 from ualextractor.models import Dataset
@@ -42,7 +41,6 @@ class Inspector:
         db_path = dataset.db_path
         if not db_path.exists() or not db_path.is_dir():
             logger.warning("Invalid dataset db path: %s", db_path)
-            # Build empty optional_folders mapping
             empty_optional = {name: False for name in OPTIONAL_FOLDERS}
             return InspectionResult(
                 dataset=dataset,
@@ -51,11 +49,16 @@ class Inspector:
                 optional_folders=empty_optional,
                 trace_file_count=0,
                 status=InspectionStatus.INVALID,
+                optional_folder_paths={name: None for name in OPTIONAL_FOLDERS},
             )
 
         has_diagnostics, has_uuidtext = self._check_required_folders(db_path)
-        optional_map = self._check_optional_folders(db_path)
-        trace_count = self._count_trace_files(db_path)
+        optional_map, optional_paths = self._check_optional_folders(
+            db_path,
+            db_path / "diagnostics",
+        )
+        trace_counts = self._count_trace_files(db_path)
+        trace_count = sum(trace_counts.values())
         status = self._determine_status(has_diagnostics, has_uuidtext)
 
         result = InspectionResult(
@@ -65,6 +68,8 @@ class Inspector:
             optional_folders=optional_map,
             trace_file_count=trace_count,
             status=status,
+            optional_folder_paths=optional_paths,
+            trace_files_by_directory=trace_counts,
         )
 
         logger.info(
@@ -81,17 +86,39 @@ class Inspector:
         uuidtext = (db_path / "uuidtext").is_dir()
         return diagnostics, uuidtext
 
-    def _check_optional_folders(self, db_path: Path) -> dict[str, bool]:
-        """Return a mapping of optional folder name -> presence."""
-        return {name: (db_path / name).is_dir() for name in OPTIONAL_FOLDERS}
+    def _check_optional_folders(
+        self,
+        db_path: Path,
+        diagnostics_path: Path,
+    ) -> tuple[dict[str, bool], dict[str, Path | None]]:
+        """Find optional folders below diagnostics, with a legacy db fallback."""
+        paths: dict[str, Path | None] = {}
+        for name in OPTIONAL_FOLDERS:
+            path = self._find_directory(diagnostics_path, name)
+            if path is None:
+                path = self._find_directory(db_path, name)
+            paths[name] = path
+        return (
+            {name: path is not None for name, path in paths.items()},
+            paths,
+        )
 
-    def _count_trace_files(self, db_path: Path) -> int:
-        """Count files matching TRACE_GLOB recursively under db_path."""
-        count = 0
+    def _find_directory(self, parent: Path, expected_name: str) -> Path | None:
+        """Find a direct child directory without relying on name casing."""
+        if not parent.is_dir():
+            return None
+        for child in sorted(parent.iterdir(), key=lambda path: path.name.casefold()):
+            if child.is_dir() and child.name.casefold() == expected_name.casefold():
+                return child
+        return None
+
+    def _count_trace_files(self, db_path: Path) -> dict[Path, int]:
+        """Count trace files grouped by their containing directory."""
+        counts: dict[Path, int] = {}
         for p in db_path.rglob(TRACE_GLOB):
             if p.is_file():
-                count += 1
-        return count
+                counts[p.parent] = counts.get(p.parent, 0) + 1
+        return dict(sorted(counts.items(), key=lambda item: str(item[0])))
 
     def _determine_status(self, has_diagnostics: bool, has_uuidtext: bool) -> InspectionStatus:
         """Return InspectionStatus based on required folder presence."""

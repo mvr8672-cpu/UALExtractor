@@ -40,8 +40,14 @@ def _print_report(result: InspectionResult) -> None:
     print(f"uuidtext: {_format_presence(result.has_uuidtext)}")
     print("optional folders:")
     for name, present in result.optional_folders.items():
-        print(f"  {name}: {_format_presence(present)}")
+        path = result.optional_folder_paths.get(name)
+        location = f" ({path})" if path is not None else ""
+        print(f"  {name}: {_format_presence(present)}{location}")
     print(f"number of .tracev3 files: {result.trace_file_count}")
+    if result.trace_files_by_directory:
+        print("tracev3 files by directory:")
+        for directory, count in result.trace_files_by_directory.items():
+            print(f"  {directory}: {count}")
     print(f"inspection status: {result.status.value}")
 
 

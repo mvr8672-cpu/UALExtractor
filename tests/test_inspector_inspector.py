@@ -47,6 +47,10 @@ def test_inspect_complete_dataset_counts_traces_and_detects_folders(tmp_path: Pa
     assert result.optional_folders["signpost"] is True
     assert result.optional_folders["timesync"] is True
     assert result.trace_file_count == 2
+    assert result.trace_files_by_directory == {
+        db_dir: 1,
+        nested: 1,
+    }
 
 
 def test_inspect_incomplete_dataset_missing_uuidtext(tmp_path: Path) -> None:
