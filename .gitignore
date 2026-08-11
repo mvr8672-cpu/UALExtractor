@@ -13,3 +13,5 @@ __pycache__/
 
 # VS Code
 .vscode/
+# Python package metadata
+*.egg-info/
