@@ -7,6 +7,8 @@ from typing import Sequence
 from ualextractor.inspector.finder import UFEDFinder
 from ualextractor.inspector.inspection import InspectionResult
 from ualextractor.inspector.inspector import Inspector
+from ualextractor.inventory import TraceInventoryScanner
+from ualextractor.models import TraceInventory
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -21,6 +23,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="discover and inspect UFED datasets under ROOT",
     )
     inspect_parser.add_argument(
+        "root",
+        type=Path,
+        help="root directory containing the UFED export",
+    )
+    inventory_parser = subparsers.add_parser(
+        "inventory",
+        help="inventory UFED Unified Log trace files under ROOT",
+    )
+    inventory_parser.add_argument(
         "root",
         type=Path,
         help="root directory containing the UFED export",
@@ -65,10 +76,45 @@ def _inspect_root(root: Path) -> int:
     return 0
 
 
+def _print_inventory(dataset_root: Path, inventory: TraceInventory) -> None:
+    print(f"Dataset root: {dataset_root}")
+    print("trace components:")
+    for component, count in inventory.count_by_component.items():
+        print(
+            f"  {component}: {count} trace files, "
+            f"{inventory.size_by_component[component]} bytes"
+        )
+    print(f"overall trace files: {inventory.total_count}")
+    print(f"overall bytes: {inventory.total_size_bytes}")
+
+
+def _inventory_root(root: Path) -> int:
+    datasets = UFEDFinder().find_datasets(root)
+    if not datasets:
+        print(f"No valid UFED dataset found under: {root.expanduser()}")
+        return 0
+
+    inspector = Inspector()
+    scanner = TraceInventoryScanner()
+    for index, dataset in enumerate(datasets):
+        if index:
+            print()
+        result = inspector.inspect(dataset)
+        _print_inventory(dataset.dataset_root, scanner.scan(result))
+    return 0
+    for index, dataset in enumerate(datasets):
+        if index:
+            print()
+        _print_report(inspector.inspect(dataset))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "inspect":
         return _inspect_root(args.root)
+    if args.command == "inventory":
+        return _inventory_root(args.root)
     return 0
 
 
