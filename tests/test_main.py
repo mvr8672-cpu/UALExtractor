@@ -94,3 +94,26 @@ def test_inventory_accepts_paths_containing_spaces(capsys, tmp_path: Path) -> No
     assert exit_code == 0
     assert f"Dataset root: {db_dir.parent}" in output
     assert "Persist: 1 trace files, 3 bytes" in output
+
+
+def test_decode_poc_keeps_jsonl_on_stdout_and_diagnostics_on_stderr(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:
+    db_dir = _make_dataset(tmp_path)
+    (db_dir / "diagnostics" / "HighVolume").mkdir()
+    trace_path = db_dir / "diagnostics" / "HighVolume" / "small.tracev3"
+    trace_path.write_bytes(b"x")
+
+    class Result:
+        records = ()
+        diagnostics = ("missing string reference",)
+
+    monkeypatch.setattr(
+        "ualextractor.main.RustDecoder.decode_one",
+        lambda self, inspection: Result(),
+    )
+
+    assert main(["decode-poc", str(tmp_path), "--decoder", "helper"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "missing string reference\n"

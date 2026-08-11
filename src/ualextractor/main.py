@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 
+from ualextractor.decoder import RustDecoder
 from ualextractor.inspector.finder import UFEDFinder
 from ualextractor.inspector.inspection import InspectionResult
 from ualextractor.inspector.inspector import Inspector
@@ -35,6 +39,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "root",
         type=Path,
         help="root directory containing the UFED export",
+    )
+    decode_parser = subparsers.add_parser(
+        "decode-poc",
+        help="decode one HighVolume or Persist tracev3 file",
+    )
+    decode_parser.add_argument("root", type=Path)
+    decode_parser.add_argument(
+        "--decoder",
+        type=Path,
+        required=True,
+        help="path to the Rust decoder helper executable",
     )
     return parser
 
@@ -102,10 +117,21 @@ def _inventory_root(root: Path) -> int:
         result = inspector.inspect(dataset)
         _print_inventory(dataset.dataset_root, scanner.scan(result))
     return 0
-    for index, dataset in enumerate(datasets):
-        if index:
-            print()
-        _print_report(inspector.inspect(dataset))
+
+
+def _decode_poc_root(root: Path, decoder_path: Path) -> int:
+    datasets = UFEDFinder().find_datasets(root)
+    if not datasets:
+        print(f"No valid UFED dataset found under: {root.expanduser()}")
+        return 0
+    if len(datasets) > 1:
+        raise ValueError("decode-poc requires a root containing exactly one dataset")
+
+    result = RustDecoder(decoder_path).decode_one(Inspector().inspect(datasets[0]))
+    for diagnostic in result.diagnostics:
+        print(diagnostic, file=sys.stderr)
+    for record in result.records:
+        print(json.dumps(asdict(record), sort_keys=True))
     return 0
 
 
@@ -115,6 +141,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _inspect_root(args.root)
     if args.command == "inventory":
         return _inventory_root(args.root)
+    if args.command == "decode-poc":
+        return _decode_poc_root(args.root, args.decoder)
     return 0
 
 
