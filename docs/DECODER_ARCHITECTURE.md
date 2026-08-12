@@ -39,3 +39,35 @@ the direct UFED-to-Rust-to-JSONL path:
 
 These results validate the decoder path without committing decoded evidence,
 including log messages, to the repository.
+
+## Batch decoding architecture
+
+Sprint 7 adds a Python batch orchestration layer on top of the single-trace
+Rust helper. The helper remains unchanged and continues to decode exactly one
+trace at a time.
+
+The batch architecture is intentionally safe and deterministic:
+
+- Batch decoding is explicit. Users must request specific components with
+  `--component`. There is no implicit "decode everything" default.
+- Trace ordering is canonical: `HighVolume`, `Persist`, `Signpost`, then
+  `Special`, and within each component traces are sorted by full path.
+- Records are streamed incrementally. The batch decoder writes JSONL as each
+  record arrives and retains only per-trace counters in memory.
+- Diagnostics and progress are kept on stderr. JSONL output remains machine-
+  readable and is never polluted with diagnostic text.
+- Each trace is isolated: exits, parsing failures, or malformed records for
+  one trace are reported in the batch summary without corrupting other traces.
+- If a trace emits malformed JSONL, the batch marks that trace as failed,
+  records the failure, and continues with the next trace by default.
+- Output file creation is protected. Existing files are not overwritten unless
+  `--force` is provided.
+
+### Current limitations
+
+- Sprint 7 still uses sequential decoding only. Parallel decoding may be added
+  later after the batch architecture is stable.
+- The current helper still decodes one trace at a time and does not merge
+  multiple traces internally.
+- The batch decoder requires a single UFED dataset root and does not span
+  multiple dataset roots in one invocation.

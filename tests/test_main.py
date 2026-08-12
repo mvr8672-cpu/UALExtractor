@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from ualextractor.main import main
 
 
@@ -117,3 +119,62 @@ def test_decode_poc_keeps_jsonl_on_stdout_and_diagnostics_on_stderr(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "missing string reference\n"
+
+
+def test_decode_cli_requires_component(capsys, tmp_path: Path) -> None:
+    db_dir = _make_dataset(tmp_path)
+    (db_dir / "diagnostics" / "HighVolume").mkdir()
+    trace_path = db_dir / "diagnostics" / "HighVolume" / "small.tracev3"
+    trace_path.write_bytes(b"x")
+
+    with pytest.raises(SystemExit):
+        main(["decode", str(tmp_path), "--decoder", "helper"])
+
+
+def test_decode_cli_writes_output_and_prints_summary(
+    capsys, tmp_path: Path, monkeypatch
+) -> None:
+    db_dir = _make_dataset(tmp_path)
+    (db_dir / "diagnostics" / "HighVolume").mkdir()
+    trace_path = db_dir / "diagnostics" / "HighVolume" / "small.tracev3"
+    trace_path.write_bytes(b"x")
+
+    class Summary:
+        requested_components = ("HighVolume",)
+        traces_attempted = 1
+        traces_succeeded = 1
+        traces_failed = 0
+        total_records = 1
+        records_by_component = {"HighVolume": 1}
+        trace_results = (
+            type(
+                "Result",
+                (),
+                {
+                    "trace_path": trace_path,
+                    "succeeded": True,
+                    "record_count": 1,
+                    "diagnostics": (),
+                },
+            ),
+        )
+        elapsed_seconds = 0.01
+
+    monkeypatch.setattr(
+        "ualextractor.main.RustDecoder.decode_batch",
+        lambda self, inspection, components, output_path, force, stop_on_error: Summary(),
+    )
+
+    assert main([
+        "decode",
+        str(tmp_path),
+        "--component",
+        "HighVolume",
+        "--decoder",
+        "helper",
+        "--output",
+        str(tmp_path / "out.jsonl"),
+    ]) == 0
+    captured = capsys.readouterr()
+    assert "Batch decode summary:" in captured.err
+    assert "requested components: HighVolume" in captured.err

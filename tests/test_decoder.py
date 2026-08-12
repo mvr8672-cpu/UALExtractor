@@ -1,3 +1,4 @@
+import io
 import json
 from pathlib import Path
 
@@ -171,3 +172,256 @@ def test_decoder_rejects_missing_poc_trace(tmp_path: Path) -> None:
 
     with pytest.raises(DecoderError, match="No HighVolume or Persist"):
         RustDecoder(tmp_path / "helper").decode_one(inspection)
+
+
+def _make_process(stdout_lines: list[str], stderr_text: str = "", returncode: int = 0):
+    class Process:
+        def __init__(self):
+            self.stdout = iter(stdout_lines)
+            self.stderr = io.StringIO(stderr_text)
+            self.returncode = returncode
+
+        def wait(self):
+            return self.returncode
+
+    return Process()
+
+
+def test_decode_batch_deterministic_component_and_trace_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "case" / "db"
+    diagnostics = db / "diagnostics"
+    (db / "uuidtext" / "dsc").mkdir(parents=True)
+    (diagnostics / "timesync").mkdir(parents=True)
+    order = []
+
+    for component in ["Special", "Persist", "HighVolume", "Signpost"]:
+        component_path = diagnostics / component
+        component_path.mkdir(parents=True)
+        for name in ["b.tracev3", "a.tracev3"]:
+            (component_path / name).write_bytes(b"x")
+
+    inspection = Inspector().inspect(Dataset(tmp_path / "case", db, diagnostics, db / "uuidtext"))
+
+    def popen(command, stdout, stderr, text):
+        trace_path = Path(command[command.index("--trace") + 1])
+        order.append(str(trace_path))
+        return _make_process([json.dumps({"timestamp": "2026-08-12T00:00:00Z"}) + "\n"])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+    output_file = tmp_path / "output.jsonl"
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["Persist", "HighVolume", "Signpost"],
+        output_path=output_file,
+    )
+
+    assert summary.traces_attempted == 6
+    assert summary.traces_succeeded == 6
+    assert summary.traces_failed == 0
+    assert order == [
+        str(diagnostics / "HighVolume" / "a.tracev3"),
+        str(diagnostics / "HighVolume" / "b.tracev3"),
+        str(diagnostics / "Persist" / "a.tracev3"),
+        str(diagnostics / "Persist" / "b.tracev3"),
+        str(diagnostics / "Signpost" / "a.tracev3"),
+        str(diagnostics / "Signpost" / "b.tracev3"),
+    ]
+
+
+def test_decode_batch_filters_components_explicitly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "case" / "db"
+    diagnostics = db / "diagnostics"
+    (db / "uuidtext" / "dsc").mkdir(parents=True)
+    (diagnostics / "timesync").mkdir(parents=True)
+    (diagnostics / "Persist").mkdir(parents=True)
+    (diagnostics / "Special").mkdir(parents=True)
+    (diagnostics / "Persist" / "trace.tracev3").write_bytes(b"x")
+    (diagnostics / "Special" / "trace.tracev3").write_bytes(b"x")
+
+    inspection = Inspector().inspect(Dataset(tmp_path / "case", db, diagnostics, db / "uuidtext"))
+    commands: list[list[str]] = []
+
+    def popen(command, stdout, stderr, text):
+        commands.append(command)
+        return _make_process([json.dumps({"timestamp": "2026-08-12T00:00:00Z"}) + "\n"])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["Persist"],
+        output_path=tmp_path / "output.jsonl",
+    )
+
+    assert summary.traces_attempted == 1
+    assert summary.traces_succeeded == 1
+    assert summary.traces_failed == 0
+    assert Path(commands[0][commands[0].index("--trace") + 1]).name == "trace.tracev3"
+
+
+def test_decode_batch_empty_requested_component(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inspection = _inspection(tmp_path)
+
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["Signpost"],
+        output_path=tmp_path / "output.jsonl",
+    )
+
+    assert summary.traces_attempted == 0
+    assert summary.traces_succeeded == 0
+    assert summary.traces_failed == 0
+    assert summary.total_records == 0
+    assert tmp_path.joinpath("output.jsonl").exists()
+
+
+def test_decode_batch_zero_record_trace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inspection = _inspection(tmp_path)
+    monkeypatch.setattr(
+        "ualextractor.decoder.subprocess.Popen",
+        lambda *args, **kwargs: _make_process([], returncode=0),
+    )
+
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume"],
+        output_path=tmp_path / "output.jsonl",
+    )
+
+    assert summary.traces_attempted == 1
+    assert summary.traces_succeeded == 1
+    assert summary.traces_failed == 0
+    assert summary.total_records == 0
+
+
+def test_decode_batch_malformed_jsonl_marks_trace_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inspection = _inspection(tmp_path)
+    def popen(command, stdout, stderr, text):
+        return _make_process([
+            json.dumps({"timestamp": "2026-08-12T00:00:00Z"}) + "\n",
+            "{not-json}\n",
+        ], stderr_text="")
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume"],
+        output_path=tmp_path / "output.jsonl",
+    )
+
+    assert summary.traces_attempted == 1
+    assert summary.traces_succeeded == 0
+    assert summary.traces_failed == 1
+    assert summary.total_records == 1
+    assert summary.trace_results[0].diagnostics
+    assert "Malformed JSONL" in summary.trace_results[0].diagnostics[0]
+
+
+def test_decode_batch_failure_isolated_and_continues_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inspection = _inspection(tmp_path)
+    call_count = 0
+
+    def popen(command, stdout, stderr, text):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _make_process([], stderr_text="error\n", returncode=1)
+        return _make_process([json.dumps({"timestamp": "2026-08-12T00:00:00Z"}) + "\n"])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume", "Persist"],
+        output_path=tmp_path / "output.jsonl",
+    )
+
+    assert summary.traces_attempted == 2
+    assert summary.traces_succeeded == 1
+    assert summary.traces_failed == 1
+    assert summary.total_records == 1
+    assert any(not result.succeeded for result in summary.trace_results)
+
+
+def test_decode_batch_stop_on_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inspection = _inspection(tmp_path)
+    call_count = 0
+
+    def popen(command, stdout, stderr, text):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _make_process([], stderr_text="error\n", returncode=1)
+        return _make_process([json.dumps({"timestamp": "2026-08-12T00:00:00Z"}) + "\n"])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume", "Persist"],
+        output_path=tmp_path / "output.jsonl",
+        stop_on_error=True,
+    )
+
+    assert summary.traces_attempted == 1
+    assert summary.traces_succeeded == 0
+    assert summary.traces_failed == 1
+    assert summary.total_records == 0
+
+
+def test_decode_batch_output_file_overwrite_protection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inspection = _inspection(tmp_path)
+    output_file = tmp_path / "output.jsonl"
+    output_file.write_text("existing")
+
+    monkeypatch.setattr(
+        "ualextractor.decoder.subprocess.Popen",
+        lambda *args, **kwargs: _make_process([json.dumps({"timestamp": "2026-08-12T00:00:00Z"}) + "\n"]),
+    )
+
+    with pytest.raises(DecoderError, match="Output file already exists"):
+        RustDecoder(tmp_path / "helper").decode_batch(
+            inspection,
+            ["HighVolume"],
+            output_path=output_file,
+        )
+
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume"],
+        output_path=output_file,
+        force=True,
+    )
+    assert summary.traces_succeeded == 1
+
+
+def test_decode_batch_paths_containing_spaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "UFED export with spaces"
+    db = root / "case" / "db"
+    diagnostics = db / "diagnostics"
+    (db / "uuidtext" / "dsc").mkdir(parents=True)
+    (diagnostics / "timesync").mkdir(parents=True)
+    hv = diagnostics / "HighVolume"
+    hv.mkdir(parents=True)
+    trace_path = hv / "trace with spaces.tracev3"
+    trace_path.write_bytes(b"x")
+    inspection = Inspector().inspect(Dataset(root / "case", db, diagnostics, db / "uuidtext"))
+    called = []
+
+    def popen(command, stdout, stderr, text):
+        called.append(command)
+        return _make_process([json.dumps({"timestamp": "2026-08-12T00:00:00Z"}) + "\n"])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+    RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume"],
+        output_path=tmp_path / "output.jsonl",
+    )
+
+    assert any(str(trace_path) in " ".join(command) for command in called)
