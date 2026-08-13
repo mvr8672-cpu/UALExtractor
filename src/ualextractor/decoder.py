@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import subprocess
 import sys
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Sequence
 
+from ualextractor.filtering import FilterSpec
 from ualextractor.inspector.inspection import InspectionResult
 from ualextractor.inventory import TraceInventoryScanner
 from ualextractor.models import UNIFIED_LOG_TRACE_COMPONENTS
@@ -49,8 +51,11 @@ class TraceDecodeResult:
     component: str
     exit_code: int
     record_count: int
-    diagnostics: tuple[str, ...]
-    succeeded: bool
+    records_decoded: int = 0
+    records_matched: int = 0
+    records_filtered_out: int = 0
+    diagnostics: tuple[str, ...] = ()
+    succeeded: bool = True
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,9 @@ class BatchDecodeSummary:
     traces_succeeded: int
     traces_failed: int
     total_records: int
+    records_decoded: int
+    records_matched: int
+    records_filtered_out: int
     records_by_component: dict[str, int]
     trace_results: tuple[TraceDecodeResult, ...]
     elapsed_seconds: float
@@ -150,6 +158,8 @@ class RustDecoder:
        output_path: Path | None = None,
        force: bool = False,
        stop_on_error: bool = False,
+       filter_spec: FilterSpec | None = None,
+       output_format: str = "jsonl",
     ) -> BatchDecodeSummary:
        """Decode an explicit batch of traces by component.
 
@@ -173,24 +183,80 @@ class RustDecoder:
            )
        )
 
+       csv_writer = None
        if output_path is not None:
            self._ensure_output_path(output_path, force, inspection)
-           writer: IO[str] = output_path.open("w", encoding="utf-8")
+           # open with newline="" to let csv module handle newlines correctly
+           writer: IO[str] = output_path.open("w", encoding="utf-8", newline="")
            should_close_writer = True
        else:
            writer = sys.stdout
            should_close_writer = False
 
+       if output_format == "csv":
+           csv_writer = csv.writer(writer)
+           # write header once
+           csv_writer.writerow([
+               "timestamp",
+               "process",
+               "pid",
+               "subsystem",
+               "category",
+               "event_type",
+               "log_type",
+               "message",
+               "component",
+               "source_trace_path",
+           ])
+           try:
+               writer.flush()
+           except Exception:
+               pass
+
        start_time = time.perf_counter()
        trace_results: list[TraceDecodeResult] = []
        try:
+           # prepare progress tracking
+           total_bytes = sum(getattr(tf, 'size_bytes', 0) for tf in trace_files)
+           processed_bytes = 0
+           current_trace_index = 0
+           last_progress_time = time.perf_counter()
+
            for trace_file in trace_files:
+               current_trace_index += 1
+               # print progress start for this trace
+               try:
+                   pct = (processed_bytes / total_bytes * 100) if total_bytes else (current_trace_index / max(1, len(trace_files)) * 100)
+                   print(
+                       f"{trace_file.component} [{current_trace_index}/{len(trace_files)}] {pct:5.1f}%\n"
+                       f"decoded={0} matched={0} elapsed=0:00:00",
+                       file=sys.stderr,
+                   )
+               except Exception:
+                   pass
+
                trace_result = self._decode_trace(
                    inspection,
                    trace_file,
                    writer,
+                   filter_spec,
+                   output_format=output_format,
+                   csv_writer=csv_writer,
                )
                trace_results.append(trace_result)
+               # advance bytes
+               processed_bytes += getattr(trace_file, 'size_bytes', 0)
+               # print progress after finishing trace
+               try:
+                   pct = (processed_bytes / total_bytes * 100) if total_bytes else (current_trace_index / max(1, len(trace_files)) * 100)
+                   print(
+                       f"{trace_file.component} [{current_trace_index}/{len(trace_files)}] {pct:5.1f}%\n"
+                       f"decoded={trace_result.records_decoded} matched={trace_result.records_matched} elapsed={time.strftime('%H:%M:%S', time.gmtime(time.perf_counter()-start_time))}",
+                       file=sys.stderr,
+                   )
+               except Exception:
+                   pass
+
                if not trace_result.succeeded and stop_on_error:
                    break
        finally:
@@ -198,6 +264,9 @@ class RustDecoder:
                writer.close()
 
        total_records = sum(result.record_count for result in trace_results)
+       records_decoded = sum(result.records_decoded for result in trace_results)
+       records_matched = sum(result.records_matched for result in trace_results)
+       records_filtered_out = sum(result.records_filtered_out for result in trace_results)
        records_by_component = {
            component: 0 for component in UNIFIED_LOG_TRACE_COMPONENTS
        }
@@ -214,6 +283,9 @@ class RustDecoder:
            traces_succeeded=succeeded,
            traces_failed=failed,
            total_records=total_records,
+           records_decoded=records_decoded,
+           records_matched=records_matched,
+           records_filtered_out=records_filtered_out,
            records_by_component=records_by_component,
            trace_results=tuple(trace_results),
            elapsed_seconds=elapsed_seconds,
@@ -254,6 +326,10 @@ class RustDecoder:
        inspection: InspectionResult,
        trace_file: "TraceFile",
        writer: IO[str],
+       filter_spec: FilterSpec | None = None,
+       *,
+       output_format: str = "jsonl",
+       csv_writer=None,
     ) -> TraceDecodeResult:
        diagnostics_path = inspection.dataset.diagnostics_path
        uuidtext_path = inspection.dataset.uuidtext_path
@@ -284,6 +360,9 @@ class RustDecoder:
        )
 
        record_count = 0
+       records_decoded = 0
+       records_matched = 0
+       records_filtered_out = 0
        diagnostics: list[str] = []
        succeeded = True
 
@@ -308,11 +387,48 @@ class RustDecoder:
                succeeded = False
                continue
 
+           records_decoded += 1
            payload["source_trace_path"] = str(trace_file.path)
            payload["component"] = trace_file.component
-           writer.write(json.dumps(payload, sort_keys=True) + "\n")
-           writer.flush()
+           if filter_spec is not None and not filter_spec.matches(payload):
+               records_filtered_out += 1
+               continue
+           # Output according to requested format
+           if output_format == "jsonl":
+               writer.write(json.dumps(payload, sort_keys=True) + "\n")
+               try:
+                   writer.flush()
+               except Exception:
+                   pass
+           elif output_format == "csv":
+               # write CSV row in exact header order
+               row = [
+                   payload.get("timestamp") or "",
+                   payload.get("process") or "",
+                   str(payload.get("pid")) if payload.get("pid") is not None else "",
+                   payload.get("subsystem") or "",
+                   payload.get("category") or "",
+                   payload.get("event_type") or "",
+                   payload.get("log_type") or "",
+                   payload.get("message") or "",
+                   payload.get("component") or "",
+                   payload.get("source_trace_path") or "",
+               ]
+               if csv_writer is None:
+                   # fallback: create a temporary csv writer
+                   local_csv = csv.writer(writer)
+                   local_csv.writerow(row)
+               else:
+                   csv_writer.writerow(row)
+               try:
+                   writer.flush()
+               except Exception:
+                   pass
+           else:
+               raise RuntimeError(f"Unknown output format: {output_format}")
+
            record_count += 1
+           records_matched += 1
 
        stderr = process.stderr.read()
        process.wait()
@@ -325,11 +441,23 @@ class RustDecoder:
            )
            succeeded = False
 
+       # If output is to stdout (streaming), emit diagnostics to stderr immediately
+       try:
+           if writer is sys.stdout and diagnostics:
+               for d in diagnostics:
+                   print(d, file=sys.stderr)
+       except Exception:
+           # best-effort: do not fail decoding if printing diagnostics fails
+           pass
+
        return TraceDecodeResult(
            trace_path=trace_file.path,
            component=trace_file.component,
            exit_code=process.returncode,
            record_count=record_count,
+           records_decoded=records_decoded,
+           records_matched=records_matched,
+           records_filtered_out=records_filtered_out,
            diagnostics=tuple(diagnostics),
            succeeded=succeeded,
        )

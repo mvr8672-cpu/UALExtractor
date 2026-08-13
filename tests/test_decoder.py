@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from ualextractor.decoder import DecoderError, RustDecoder
+from ualextractor.filtering import FilterSpec
 from ualextractor.inspector.inspector import Inspector
 from ualextractor.models import Dataset
 
@@ -374,14 +375,26 @@ def test_decode_batch_stop_on_error(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert summary.total_records == 0
 
 
-def test_decode_batch_output_file_overwrite_protection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("output_name", "output_format"),
+    [
+        ("output.jsonl", "jsonl"),
+        ("output.csv", "csv"),
+    ],
+    ids=["jsonl", "csv"],
+)
+def test_decode_batch_rejects_existing_output_file_without_force(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_name: str, output_format: str
+) -> None:
     inspection = _inspection(tmp_path)
-    output_file = tmp_path / "output.jsonl"
-    output_file.write_text("existing")
+    output_file = tmp_path / output_name
+    output_file.write_text("existing", encoding="utf-8")
 
     monkeypatch.setattr(
         "ualextractor.decoder.subprocess.Popen",
-        lambda *args, **kwargs: _make_process([json.dumps({"timestamp": "2026-08-12T00:00:00Z"}) + "\n"]),
+        lambda *args, **kwargs: _make_process(
+            [json.dumps({"timestamp": "2026-08-12T00:00:00Z"}) + "\n"]
+        ),
     )
 
     with pytest.raises(DecoderError, match="Output file already exists"):
@@ -389,15 +402,78 @@ def test_decode_batch_output_file_overwrite_protection(tmp_path: Path, monkeypat
             inspection,
             ["HighVolume"],
             output_path=output_file,
+            output_format=output_format,
         )
+
+
+@pytest.mark.parametrize(
+    ("output_name", "output_format", "expected_snippet"),
+    [
+        ("output.jsonl", "jsonl", '"timestamp": "2026-08-12T00:00:00Z"'),
+        ("output.csv", "csv", "timestamp,process,pid,subsystem,category,event_type,log_type,message,component,source_trace_path"),
+    ],
+    ids=["jsonl", "csv"],
+)
+def test_decode_batch_force_overwrites_existing_output_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_name: str,
+    output_format: str,
+    expected_snippet: str,
+) -> None:
+    inspection = _inspection(tmp_path)
+    output_file = tmp_path / output_name
+    output_file.write_text("existing", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "ualextractor.decoder.subprocess.Popen",
+        lambda *args, **kwargs: _make_process(
+            [json.dumps({"timestamp": "2026-08-12T00:00:00Z", "process": "example"}) + "\n"]
+        ),
+    )
 
     summary = RustDecoder(tmp_path / "helper").decode_batch(
         inspection,
         ["HighVolume"],
         output_path=output_file,
         force=True,
+        output_format=output_format,
     )
+
     assert summary.traces_succeeded == 1
+    written = output_file.read_text(encoding="utf-8")
+    assert "existing" not in written
+    assert expected_snippet in written
+
+
+@pytest.mark.parametrize(
+    ("output_name", "output_format"),
+    [
+        ("inside-dataset.jsonl", "jsonl"),
+        ("inside-dataset.csv", "csv"),
+    ],
+    ids=["jsonl", "csv"],
+)
+def test_decode_batch_rejects_output_path_inside_evidence_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_name: str, output_format: str
+) -> None:
+    inspection = _inspection(tmp_path)
+    output_file = inspection.dataset.dataset_root / "exports" / output_name
+
+    monkeypatch.setattr(
+        "ualextractor.decoder.subprocess.Popen",
+        lambda *args, **kwargs: _make_process(
+            [json.dumps({"timestamp": "2026-08-12T00:00:00Z"}) + "\n"]
+        ),
+    )
+
+    with pytest.raises(DecoderError, match="Output path must not be inside the evidence dataset"):
+        RustDecoder(tmp_path / "helper").decode_batch(
+            inspection,
+            ["HighVolume"],
+            output_path=output_file,
+            output_format=output_format,
+        )
 
 
 def test_decode_batch_paths_containing_spaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -425,3 +501,111 @@ def test_decode_batch_paths_containing_spaces(tmp_path: Path, monkeypatch: pytes
     )
 
     assert any(str(trace_path) in " ".join(command) for command in called)
+
+
+def test_decode_batch_filters_with_process_pid_and_contains(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inspection = _inspection(tmp_path)
+    records = [
+        {
+            "timestamp": "2026-05-02T05:00:00Z",
+            "process": "SpringBoard",
+            "pid": 123,
+            "subsystem": "com.apple.bluetooth",
+            "category": "AirPlay",
+            "event_type": "Log",
+            "log_type": "Info",
+            "message": "bluetooth session started",
+        },
+        {
+            "timestamp": "2026-05-02T05:00:01Z",
+            "process": "bluetoothd",
+            "pid": 456,
+            "subsystem": "com.apple.networking",
+            "category": "WiFi",
+            "event_type": "Log",
+            "log_type": "Info",
+            "message": "different message",
+        },
+    ]
+
+    def popen(command, stdout, stderr, text):
+        return _make_process([json.dumps(records[0]) + "\n", json.dumps(records[1]) + "\n"])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume"],
+        output_path=tmp_path / "filtered.jsonl",
+        filter_spec=FilterSpec.from_cli(
+            process=["SpringBoard", "bluetoothd"],
+            pid=[123],
+            contains=["AirPlay"],
+        ),
+    )
+
+    assert summary.traces_attempted == 1
+    assert summary.records_decoded == 2
+    assert summary.records_matched == 1
+    assert summary.records_filtered_out == 1
+    assert summary.trace_results[0].records_decoded == 2
+    assert summary.trace_results[0].records_matched == 1
+    assert summary.trace_results[0].records_filtered_out == 1
+
+
+def test_decode_batch_time_filters_and_bounds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inspection = _inspection(tmp_path)
+    payloads = [
+        {"timestamp": "2026-05-02T05:00:00Z", "process": "SpringBoard", "pid": 1, "subsystem": "sub", "category": "cat", "event_type": "Log", "log_type": "Info", "message": "ok"},
+        {"timestamp": "2026-05-02T06:00:00Z", "process": "SpringBoard", "pid": 1, "subsystem": "sub", "category": "cat", "event_type": "Log", "log_type": "Info", "message": "ok"},
+        {"timestamp": "2026-05-03T00:00:00Z", "process": "SpringBoard", "pid": 1, "subsystem": "sub", "category": "cat", "event_type": "Log", "log_type": "Info", "message": "ok"},
+    ]
+
+    def popen(command, stdout, stderr, text):
+        return _make_process([json.dumps(item) + "\n" for item in payloads])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume"],
+        output_path=tmp_path / "time.jsonl",
+        filter_spec=FilterSpec.from_cli(
+            start="2026-05-02T05:00:00Z",
+            end="2026-05-02",
+        ),
+    )
+
+    assert summary.records_matched == 2
+    assert summary.records_filtered_out == 1
+
+    summary_2 = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume"],
+        output_path=tmp_path / "time_end.jsonl",
+        filter_spec=FilterSpec.from_cli(
+            end="2026-05-02T06:00:00Z",
+        ),
+    )
+    assert summary_2.records_matched == 2
+
+
+def test_filter_spec_validates_range_and_timestamp_inputs() -> None:
+    with pytest.raises(ValueError, match="invalid"):
+        FilterSpec.from_cli(start="2026-05-03", end="2026-05-02")
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        FilterSpec.from_cli(start="2026-05-02T05:00:00")
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        FilterSpec.from_cli(end="2026-05-02T05:00:00")
+
+
+def test_filter_spec_missing_timestamp_without_time_filter_is_allowed() -> None:
+    filter_spec = FilterSpec.from_cli(process=["SpringBoard"])
+    assert filter_spec.matches({"process": "SpringBoard"}) is True
+    assert filter_spec.matches({"process": "Other"}) is False
+
+
+def test_filter_spec_missing_timestamp_with_active_time_filter_does_not_match() -> None:
+    filter_spec = FilterSpec.from_cli(start="2026-05-02T00:00:00Z")
+    assert filter_spec.matches({"process": "SpringBoard"}) is False
+    assert filter_spec.matches({"timestamp": "2026-05-02T00:00:00Z", "process": "SpringBoard"}) is True

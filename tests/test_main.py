@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -145,6 +146,9 @@ def test_decode_cli_writes_output_and_prints_summary(
         traces_succeeded = 1
         traces_failed = 0
         total_records = 1
+        records_decoded = 1
+        records_matched = 1
+        records_filtered_out = 0
         records_by_component = {"HighVolume": 1}
         trace_results = (
             type(
@@ -152,8 +156,12 @@ def test_decode_cli_writes_output_and_prints_summary(
                 (),
                 {
                     "trace_path": trace_path,
+                    "component": "HighVolume",
                     "succeeded": True,
                     "record_count": 1,
+                    "records_decoded": 1,
+                    "records_matched": 1,
+                    "records_filtered_out": 0,
                     "diagnostics": (),
                 },
             ),
@@ -162,7 +170,15 @@ def test_decode_cli_writes_output_and_prints_summary(
 
     monkeypatch.setattr(
         "ualextractor.main.RustDecoder.decode_batch",
-        lambda self, inspection, components, output_path, force, stop_on_error: Summary(),
+        lambda self, inspection, components, output_path, force, stop_on_error, filter_spec=None, output_format="jsonl": (
+            output_path.write_text(
+                '{"component":"HighVolume","source_trace_path":"'
+                + str(trace_path)
+                + '"}\n',
+                encoding="utf-8",
+            ),
+            Summary(),
+        )[1],
     )
 
     assert main([
@@ -178,3 +194,115 @@ def test_decode_cli_writes_output_and_prints_summary(
     captured = capsys.readouterr()
     assert "Batch decode summary:" in captured.err
     assert "requested components: HighVolume" in captured.err
+
+
+def test_decode_cli_parses_filter_arguments(tmp_path: Path, monkeypatch) -> None:
+    db_dir = _make_dataset(tmp_path)
+    (db_dir / "diagnostics" / "HighVolume").mkdir()
+    (db_dir / "diagnostics" / "HighVolume" / "small.tracev3").write_bytes(b"x")
+
+    seen = {}
+
+    class Summary:
+        requested_components = ("HighVolume",)
+        traces_attempted = 0
+        traces_succeeded = 0
+        traces_failed = 0
+        total_records = 0
+        records_decoded = 0
+        records_matched = 0
+        records_filtered_out = 0
+        records_by_component = {"HighVolume": 0}
+        trace_results = ()
+        elapsed_seconds = 0.0
+
+    def fake_decode(self, inspection, components, output_path=None, force=False, stop_on_error=False, filter_spec=None, output_format="jsonl"):
+        seen["filter_spec"] = filter_spec
+        return Summary()
+
+    monkeypatch.setattr("ualextractor.main.RustDecoder.decode_batch", fake_decode)
+
+    assert main([
+        "decode",
+        str(tmp_path),
+        "--component",
+        "HighVolume",
+        "--decoder",
+        "helper",
+        "--process",
+        "SpringBoard",
+        "--process",
+        "bluetoothd",
+        "--pid",
+        "123",
+        "--contains",
+        "AirPlay",
+        "--start",
+        "2026-05-02T00:00:00Z",
+        "--end",
+        "2026-05-02",
+    ]) == 0
+    filter_spec = seen["filter_spec"]
+    assert filter_spec.process == ("springboard", "bluetoothd")
+    assert filter_spec.pid == (123,)
+    assert filter_spec.contains == ("airplay",)
+    assert filter_spec.start == datetime(2026, 5, 2, tzinfo=timezone.utc)
+    assert filter_spec.end_is_date_only is True
+
+
+def test_cli_format_wiring_forwards_format_and_defaults(tmp_path: Path, monkeypatch):
+    db_dir = _make_dataset(tmp_path)
+    (db_dir / "diagnostics" / "HighVolume").mkdir()
+    (db_dir / "diagnostics" / "HighVolume" / "small.tracev3").write_bytes(b"x")
+
+    seen = {}
+
+    class Summary:
+        requested_components = ("HighVolume",)
+        traces_attempted = 0
+        traces_succeeded = 0
+        traces_failed = 0
+        total_records = 0
+        records_decoded = 0
+        records_matched = 0
+        records_filtered_out = 0
+        records_by_component = {"HighVolume": 0}
+        trace_results = ()
+        elapsed_seconds = 0.0
+
+    def fake_decode(self, inspection, components, output_path=None, force=False, stop_on_error=False, filter_spec=None, output_format="jsonl"):
+        seen["components"] = components
+        seen["output_path"] = output_path
+        seen["force"] = force
+        seen["stop_on_error"] = stop_on_error
+        seen["filter_spec"] = filter_spec
+        seen["output_format"] = output_format
+        return Summary()
+
+    monkeypatch.setattr("ualextractor.main.RustDecoder.decode_batch", fake_decode)
+
+    # explicit --format csv should reach decode_batch as "csv"
+    assert main([
+        "decode",
+        str(tmp_path),
+        "--component",
+        "HighVolume",
+        "--decoder",
+        "helper",
+        "--format",
+        "csv",
+    ]) == 0
+    assert seen["output_format"] == "csv"
+    assert seen["components"] == ["HighVolume"]
+
+    # omission of --format should default to jsonl
+    seen.clear()
+    assert main([
+        "decode",
+        str(tmp_path),
+        "--component",
+        "HighVolume",
+        "--decoder",
+        "helper",
+    ]) == 0
+    assert seen["output_format"] == "jsonl"

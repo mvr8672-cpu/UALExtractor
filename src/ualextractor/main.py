@@ -3,11 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 
 from ualextractor.decoder import BatchDecodeSummary, RustDecoder
+from ualextractor.filtering import FilterSpec
+from ualextractor.forensic import (
+    _now_iso,
+    ForensicOutputError,
+    auto_output_paths,
+    validate_output_provenance,
+    write_validation_report,
+)
 from ualextractor.inspector.finder import UFEDFinder
 from ualextractor.inspector.inspection import InspectionResult
 from ualextractor.inspector.inspector import Inspector
@@ -83,6 +90,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "--stop-on-error",
         action="store_true",
         help="stop the batch when a trace decoding error occurs",
+    )
+    batch_parser.add_argument("--start", help="inclusive start timestamp or date-only UTC bound")
+    batch_parser.add_argument("--end", help="inclusive end timestamp or date-only UTC upper bound")
+    batch_parser.add_argument("--process", action="append", default=[], help="process substring filter; repeated values use OR")
+    batch_parser.add_argument("--pid", action="append", type=int, default=[], help="PID exact filter; repeated values use OR")
+    batch_parser.add_argument("--subsystem", action="append", default=[], help="subsystem substring filter; repeated values use OR")
+    batch_parser.add_argument("--category", action="append", default=[], help="category substring filter; repeated values use OR")
+    batch_parser.add_argument("--event-type", action="append", default=[], help="event type exact filter; repeated values use OR")
+    batch_parser.add_argument("--log-type", action="append", default=[], help="log type exact filter; repeated values use OR")
+    batch_parser.add_argument("--contains", action="append", default=[], help="case-insensitive text search across message/process/subsystem/category; repeated values use OR")
+    batch_parser.add_argument(
+        "--format",
+        choices=["jsonl", "csv"],
+        default="jsonl",
+        help="output format: jsonl (default) or csv",
+    )
+    batch_parser.add_argument(
+        "--downloads",
+        action="store_true",
+        help="automatic safe output naming under ~/Downloads when --output is not supplied",
     )
     return parser
 
@@ -168,6 +195,20 @@ def _decode_poc_root(root: Path, decoder_path: Path) -> int:
     return 0
 
 
+def _build_filter_spec(args: argparse.Namespace) -> FilterSpec:
+    return FilterSpec.from_cli(
+        start=args.start,
+        end=args.end,
+        process=args.process,
+        pid=args.pid,
+        subsystem=args.subsystem,
+        category=args.category,
+        event_type=args.event_type,
+        log_type=args.log_type,
+        contains=args.contains,
+    )
+
+
 def _decode_root(
     root: Path,
     decoder_path: Path,
@@ -175,6 +216,9 @@ def _decode_root(
     output: Path | None,
     force: bool,
     stop_on_error: bool,
+    filter_spec: FilterSpec | None = None,
+    output_format: str = "jsonl",
+    downloads: bool = False,
 ) -> int:
     datasets = UFEDFinder().find_datasets(root)
     if not datasets:
@@ -183,20 +227,93 @@ def _decode_root(
     if len(datasets) > 1:
         raise ValueError("decode requires a root containing exactly one dataset")
 
+    report_path: Path | None = None
+    # handle automatic Downloads naming if requested and no explicit output provided
+    if output is None and downloads:
+        descriptor = None
+        if filter_spec is not None and filter_spec.contains:
+            # use first contains term as descriptor when present
+            descriptor = filter_spec.contains[0]
+        ext = "csv" if output_format == "csv" else "jsonl"
+        try:
+            out_path, report_path = auto_output_paths(root, descriptor, ext)
+        except ForensicOutputError as error:
+            print(error, file=sys.stderr)
+            return 1
+        output = out_path
+    execution_start = _now_iso()
+
     summary = RustDecoder(decoder_path).decode_batch(
         Inspector().inspect(datasets[0]),
         components,
         output_path=output,
         force=force,
         stop_on_error=stop_on_error,
+        filter_spec=filter_spec,
+        output_format=output_format,
     )
+
+    # if output was a file, and decode_batch produced it, write a forensic report
+    if output is not None:
+        trace_results = [
+            {
+                "trace_path": r.trace_path,
+                "component": r.component,
+                "records_decoded": r.records_decoded,
+                "records_matched": r.records_matched,
+                "records_filtered_out": r.records_filtered_out,
+                "succeeded": r.succeeded,
+                "diagnostics": list(r.diagnostics),
+            }
+            for r in summary.trace_results
+        ]
+
+        execution_end = _now_iso()
+
+        fs = filter_spec
+        if fs is not None:
+            fs_repr = (
+                f"start={fs.start!r}, end={fs.end!r}, process={fs.process}, pid={fs.pid}, "
+                f"subsystem={fs.subsystem}, category={fs.category}, event_type={fs.event_type}, "
+                f"log_type={fs.log_type}, contains={fs.contains}"
+            )
+        else:
+            fs_repr = "(none)"
+
+        provenance = validate_output_provenance(output, output_format)
+
+        if report_path is None:
+            report_path = output.with_name(output.stem + "_validation.txt")
+
+        write_validation_report(
+            report_path,
+            dataset_identifier=root.name,
+            evidence_root=root,
+            output_path=output,
+            output_format=output_format,
+            components=components,
+            decoder_path=decoder_path,
+            start_time=execution_start,
+            end_time=execution_end,
+            elapsed_seconds=summary.elapsed_seconds,
+            filter_spec_repr=fs_repr,
+            trace_results=trace_results,
+            records_decoded=summary.records_decoded,
+            records_matched=summary.records_matched,
+            records_filtered_out=summary.records_filtered_out,
+            component_provenance_ok=provenance.component_ok,
+            source_trace_path_provenance_ok=provenance.source_trace_path_ok,
+        )
 
     print("Batch decode summary:", file=sys.stderr)
     print(f"  requested components: {', '.join(summary.requested_components)}", file=sys.stderr)
     print(f"  traces attempted: {summary.traces_attempted}", file=sys.stderr)
     print(f"  traces succeeded: {summary.traces_succeeded}", file=sys.stderr)
     print(f"  traces failed: {summary.traces_failed}", file=sys.stderr)
-    print(f"  total decoded records: {summary.total_records}", file=sys.stderr)
+    print(f"  total decoded records: {summary.records_decoded}", file=sys.stderr)
+    print(f"  total matched records: {summary.records_matched}", file=sys.stderr)
+    print(f"  total filtered out records: {summary.records_filtered_out}", file=sys.stderr)
+    print(f"  total emitted records: {summary.total_records}", file=sys.stderr)
     print("  records by component:", file=sys.stderr)
     for component, count in summary.records_by_component.items():
         if count:
@@ -207,7 +324,9 @@ def _decode_root(
             status = "SUCCESS" if trace_result.succeeded else "FAILED"
             print(
                 f"    {trace_result.trace_path}: {status}, "
-                f"{trace_result.record_count} records",
+                f"{trace_result.records_decoded} decoded / "
+                f"{trace_result.record_count} emitted / "
+                f"{trace_result.records_filtered_out} filtered out",
                 file=sys.stderr,
             )
             for diagnostic in trace_result.diagnostics:
@@ -225,14 +344,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "decode-poc":
         return _decode_poc_root(args.root, args.decoder)
     if args.command == "decode":
-        return _decode_root(
-            args.root,
-            args.decoder,
-            args.component,
-            args.output,
-            args.force,
-            args.stop_on_error,
-        )
+       filter_spec = _build_filter_spec(args)
+       return _decode_root(
+           args.root,
+           args.decoder,
+           args.component,
+           args.output,
+           args.force,
+           args.stop_on_error,
+           filter_spec,
+           args.format,
+           args.downloads,
+       )
     return 0
 
 
