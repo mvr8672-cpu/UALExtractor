@@ -12,3 +12,8 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+markers = [
+  "sprint10: Sprint 10 synthetic precision/time-window tests",
+]

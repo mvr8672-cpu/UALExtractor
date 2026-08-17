@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Sequence
 
-from ualextractor.filtering import FilterSpec
+from ualextractor.filtering import FilterSpec, TimeClassification
 from ualextractor.inspector.inspection import InspectionResult
 from ualextractor.inventory import TraceInventoryScanner
 from ualextractor.models import UNIFIED_LOG_TRACE_COMPONENTS
@@ -54,6 +54,12 @@ class TraceDecodeResult:
     records_decoded: int = 0
     records_matched: int = 0
     records_filtered_out: int = 0
+    records_time_matched: int = 0
+    records_time_filtered_out: int = 0
+    records_time_invalid: int = 0
+    records_filter_evaluated: int = 0
+    records_filter_matched: int = 0
+    records_filter_filtered_out: int = 0
     diagnostics: tuple[str, ...] = ()
     succeeded: bool = True
 
@@ -70,6 +76,12 @@ class BatchDecodeSummary:
     records_decoded: int
     records_matched: int
     records_filtered_out: int
+    records_time_matched: int
+    records_time_filtered_out: int
+    records_time_invalid: int
+    records_filter_evaluated: int
+    records_filter_matched: int
+    records_filter_filtered_out: int
     records_by_component: dict[str, int]
     trace_results: tuple[TraceDecodeResult, ...]
     elapsed_seconds: float
@@ -267,6 +279,20 @@ class RustDecoder:
        records_decoded = sum(result.records_decoded for result in trace_results)
        records_matched = sum(result.records_matched for result in trace_results)
        records_filtered_out = sum(result.records_filtered_out for result in trace_results)
+       records_time_matched = sum(result.records_time_matched for result in trace_results)
+       records_time_filtered_out = sum(
+           result.records_time_filtered_out for result in trace_results
+       )
+       records_time_invalid = sum(result.records_time_invalid for result in trace_results)
+       records_filter_evaluated = sum(
+           result.records_filter_evaluated for result in trace_results
+       )
+       records_filter_matched = sum(
+           result.records_filter_matched for result in trace_results
+       )
+       records_filter_filtered_out = sum(
+           result.records_filter_filtered_out for result in trace_results
+       )
        records_by_component = {
            component: 0 for component in UNIFIED_LOG_TRACE_COMPONENTS
        }
@@ -286,6 +312,12 @@ class RustDecoder:
            records_decoded=records_decoded,
            records_matched=records_matched,
            records_filtered_out=records_filtered_out,
+           records_time_matched=records_time_matched,
+           records_time_filtered_out=records_time_filtered_out,
+           records_time_invalid=records_time_invalid,
+           records_filter_evaluated=records_filter_evaluated,
+           records_filter_matched=records_filter_matched,
+           records_filter_filtered_out=records_filter_filtered_out,
            records_by_component=records_by_component,
            trace_results=tuple(trace_results),
            elapsed_seconds=elapsed_seconds,
@@ -363,8 +395,16 @@ class RustDecoder:
        records_decoded = 0
        records_matched = 0
        records_filtered_out = 0
+       records_time_matched = 0
+       records_time_filtered_out = 0
+       records_time_invalid = 0
+       records_filter_evaluated = 0
+       records_filter_matched = 0
+       records_filter_filtered_out = 0
        diagnostics: list[str] = []
        succeeded = True
+
+       time_filter_active = filter_spec is not None and filter_spec.time_filter_active
 
        assert process.stdout is not None
        assert process.stderr is not None
@@ -390,9 +430,35 @@ class RustDecoder:
            records_decoded += 1
            payload["source_trace_path"] = str(trace_file.path)
            payload["component"] = trace_file.component
-           if filter_spec is not None and not filter_spec.matches(payload):
-               records_filtered_out += 1
-               continue
+
+           if time_filter_active:
+               assert filter_spec is not None
+               time_classification = filter_spec.classify_record_time(payload)
+               if time_classification == TimeClassification.TIME_INVALID:
+                   records_time_invalid += 1
+                   records_filtered_out += 1
+                   continue
+               if time_classification == TimeClassification.TIME_FILTERED_OUT:
+                   records_time_filtered_out += 1
+                   records_filtered_out += 1
+                   continue
+               records_time_matched += 1
+               records_filter_evaluated += 1
+               if not filter_spec.matches_generic(payload):
+                   records_filter_filtered_out += 1
+                   records_filtered_out += 1
+                   continue
+               records_filter_matched += 1
+           elif filter_spec is not None:
+               records_filter_evaluated += 1
+               if not filter_spec.matches_generic(payload):
+                   records_filter_filtered_out += 1
+                   records_filtered_out += 1
+                   continue
+               records_filter_matched += 1
+           else:
+               records_filter_evaluated += 1
+               records_filter_matched += 1
            # Output according to requested format
            if output_format == "jsonl":
                writer.write(json.dumps(payload, sort_keys=True) + "\n")
@@ -458,6 +524,12 @@ class RustDecoder:
            records_decoded=records_decoded,
            records_matched=records_matched,
            records_filtered_out=records_filtered_out,
+           records_time_matched=records_time_matched,
+           records_time_filtered_out=records_time_filtered_out,
+           records_time_invalid=records_time_invalid,
+           records_filter_evaluated=records_filter_evaluated,
+           records_filter_matched=records_filter_matched,
+           records_filter_filtered_out=records_filter_filtered_out,
            diagnostics=tuple(diagnostics),
            succeeded=succeeded,
        )

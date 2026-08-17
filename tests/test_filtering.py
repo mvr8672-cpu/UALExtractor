@@ -381,3 +381,17 @@ def test_filter_summary_raw_end_preserved_verbatim() -> None:
     fs = FilterSpec.from_cli(end=raw)
     summary = format_filter_summary(fs)
     assert raw in summary
+
+
+@pytest.mark.sprint10
+def test_filter_summary_for_time_window_uses_effective_utc_and_semantics() -> None:
+    fs = FilterSpec.from_cli(
+        start="2026-05-04T14:00:00+02:00",
+        end="2026-05-04T14:15:00+02:00",
+    )
+    summary = format_filter_summary(fs)
+    assert "raw='2026-05-04T14:00:00+02:00'" in summary
+    assert "effective=2026-05-04T12:00:00Z" in summary
+    assert "effective=2026-05-04T12:15:00Z" in summary
+    assert "inclusive" in summary.lower()
+    assert "timezone" in summary.lower()

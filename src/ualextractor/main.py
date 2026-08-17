@@ -264,6 +264,26 @@ def _run_dry_run(
     # Print filter summary
     filter_summary = format_filter_summary(filter_spec)
     print(f"Filters: {filter_summary}", file=sys.stderr)
+    if filter_spec is not None and filter_spec.time_filter_active:
+        print("[Time window]", file=sys.stderr)
+        print(f"Examiner start: {filter_spec.start_raw}", file=sys.stderr)
+        print(
+            f"Effective UTC start: {filter_spec.effective_start_utc_text}",
+            file=sys.stderr,
+        )
+        print(f"Start semantics: {filter_spec.start_semantics}", file=sys.stderr)
+        print(f"Examiner end: {filter_spec.end_raw}", file=sys.stderr)
+        print(
+            f"Effective UTC end: {filter_spec.effective_end_utc_text}",
+            file=sys.stderr,
+        )
+        print(f"End semantics: {filter_spec.end_semantics}", file=sys.stderr)
+        print(
+            "record-level time membership is evaluated only after trace "
+            "records are decoded (after decoding); dry-run trace selection is based on "
+            "metadata/component/path only.",
+            file=sys.stderr,
+        )
 
     # Print each selected trace
     print("Traces:", file=sys.stderr)
@@ -351,6 +371,12 @@ def _decode_root(
                 "records_decoded": r.records_decoded,
                 "records_matched": r.records_matched,
                 "records_filtered_out": r.records_filtered_out,
+                "records_time_matched": getattr(r, "records_time_matched", 0),
+                "records_time_filtered_out": getattr(r, "records_time_filtered_out", 0),
+                "records_time_invalid": getattr(r, "records_time_invalid", 0),
+                "records_filter_evaluated": getattr(r, "records_filter_evaluated", 0),
+                "records_filter_matched": getattr(r, "records_filter_matched", 0),
+                "records_filter_filtered_out": getattr(r, "records_filter_filtered_out", 0),
                 "succeeded": r.succeeded,
                 "diagnostics": list(r.diagnostics),
             }
@@ -378,10 +404,27 @@ def _decode_root(
             end_time=execution_end,
             elapsed_seconds=summary.elapsed_seconds,
             filter_spec_repr=fs_repr,
+            time_window_applied=bool(filter_spec and filter_spec.time_filter_active),
+            examiner_start=filter_spec.start_raw if filter_spec else None,
+            effective_utc_start=(
+                filter_spec.effective_start_utc_text if filter_spec else None
+            ),
+            start_semantics=filter_spec.start_semantics if filter_spec else None,
+            examiner_end=filter_spec.end_raw if filter_spec else None,
+            effective_utc_end=(
+                filter_spec.effective_end_utc_text if filter_spec else None
+            ),
+            end_semantics=filter_spec.end_semantics if filter_spec else None,
             trace_results=trace_results,
             records_decoded=summary.records_decoded,
             records_matched=summary.records_matched,
             records_filtered_out=summary.records_filtered_out,
+            records_time_matched=getattr(summary, "records_time_matched", 0),
+            records_time_filtered_out=getattr(summary, "records_time_filtered_out", 0),
+            records_time_invalid=getattr(summary, "records_time_invalid", 0),
+            records_filter_evaluated=getattr(summary, "records_filter_evaluated", 0),
+            records_filter_matched=getattr(summary, "records_filter_matched", 0),
+            records_filter_filtered_out=getattr(summary, "records_filter_filtered_out", 0),
             component_provenance_ok=provenance.component_ok,
             source_trace_path_provenance_ok=provenance.source_trace_path_ok,
         )

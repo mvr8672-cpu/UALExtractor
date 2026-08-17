@@ -53,6 +53,7 @@ class _FrozenDateTime:
         return datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
+@pytest.mark.sprint10
 def test_choose_auto_output_descriptor_prefers_message_before_contains_and_process() -> None:
     assert choose_auto_output_descriptor(FilterSpec.from_cli(message=["bluetooth"])) == "bluetooth"
     assert choose_auto_output_descriptor(FilterSpec.from_cli(contains=["bluetooth"])) == "bluetooth"
@@ -63,9 +64,10 @@ def test_choose_auto_output_descriptor_prefers_message_before_contains_and_proce
         == "bluetooth"
     )
     assert choose_auto_output_descriptor(FilterSpec.from_cli(process=["persist"])) == "persist"
-    assert choose_auto_output_descriptor(FilterSpec.from_cli()) is None
+    assert choose_auto_output_descriptor(FilterSpec.from_cli()) == "output"
 
 
+@pytest.mark.sprint10
 def test_choose_auto_output_descriptor_sanitizes_and_falls_back_to_output(
     monkeypatch,
 ) -> None:
@@ -76,7 +78,7 @@ def test_choose_auto_output_descriptor_sanitizes_and_falls_back_to_output(
     spec = FilterSpec.from_cli(message=["bluetooth / wifi"])
     assert choose_auto_output_descriptor(spec) == "bluetooth / wifi"
     assert sanitize_filename_component(choose_auto_output_descriptor(spec)) == "bluetooth___wifi"
-    assert choose_auto_output_descriptor(FilterSpec.from_cli()) is None
+    assert choose_auto_output_descriptor(FilterSpec.from_cli()) == "output"
 
     proposed, _ = forensic.propose_auto_output_paths(Path("/tmp/aael1871nl"), None, "csv")
     assert proposed.parent.name.endswith("_output_2026-01-01")

@@ -142,12 +142,14 @@ def _ensure_writable_extraction_directory(extraction_dir: Path) -> None:
 def choose_auto_output_descriptor(filter_spec: "FilterSpec | None") -> Optional[str]:
     """Return the first safe filename descriptor according to a fixed priority."""
     if filter_spec is None:
-        return None
+        return "output"
 
     for values in (filter_spec.message, filter_spec.contains, filter_spec.process):
         if values:
             return values[0]
-    return None
+    if filter_spec.start_raw is not None or filter_spec.end_raw is not None:
+        return "timewindow"
+    return "output"
 
 
 def propose_auto_output_paths(evidence_root: Path, descriptor: Optional[str], extension: str) -> tuple[Path, Path]:
@@ -231,10 +233,23 @@ def write_validation_report(
     end_time: str,
     elapsed_seconds: float,
     filter_spec_repr: str,
+    time_window_applied: bool,
+    examiner_start: str | None,
+    effective_utc_start: str | None,
+    start_semantics: str | None,
+    examiner_end: str | None,
+    effective_utc_end: str | None,
+    end_semantics: str | None,
     trace_results: list[dict],
     records_decoded: int,
     records_matched: int,
     records_filtered_out: int,
+    records_time_matched: int,
+    records_time_filtered_out: int,
+    records_time_invalid: int,
+    records_filter_evaluated: int,
+    records_filter_matched: int,
+    records_filter_filtered_out: int,
     component_provenance_ok: bool,
     source_trace_path_provenance_ok: bool,
 ) -> None:
@@ -247,6 +262,17 @@ def write_validation_report(
         sha256 = "unavailable"
 
     invariant_ok = (records_decoded == (records_matched + records_filtered_out))
+    time_invariant_ok = (
+        records_decoded
+        == records_time_matched + records_time_filtered_out + records_time_invalid
+    )
+    filter_invariant_ok = (
+        records_filter_evaluated
+        == records_filter_matched + records_filter_filtered_out
+    )
+    filter_evaluated_matches_time_ok = (
+        (not time_window_applied) or records_filter_evaluated == records_time_matched
+    )
 
     with report_path.open("w", encoding="utf-8", newline="") as f:
         f.write("UALExtractor — Extraction Validation Report\n")
@@ -274,6 +300,23 @@ def write_validation_report(
         f.write("[Filter specification]\n")
         f.write(filter_spec_repr + "\n")
         f.write("\n")
+        f.write("[Time window]\n")
+        if time_window_applied:
+            f.write(f"Examiner start: {examiner_start}\n")
+            f.write(f"Effective UTC start: {effective_utc_start}\n")
+            f.write(f"Start semantics: {start_semantics}\n")
+            f.write(f"Examiner end: {examiner_end}\n")
+            f.write(f"Effective UTC end: {effective_utc_end}\n")
+            f.write(f"End semantics: {end_semantics}\n")
+            f.write(f"records_time_matched: {records_time_matched}\n")
+            f.write(f"records_time_filtered_out: {records_time_filtered_out}\n")
+            f.write(f"records_time_invalid: {records_time_invalid}\n")
+        else:
+            f.write("not applied\n")
+            f.write("records_time_matched: 0\n")
+            f.write("records_time_filtered_out: 0\n")
+            f.write("records_time_invalid: 0\n")
+        f.write("\n")
         f.write("[Trace processing]\n")
         f.write(f"traces attempted: {len(trace_results)}\n")
         f.write(f"traces succeeded: {sum(1 for t in trace_results if t.get('succeeded'))}\n")
@@ -295,8 +338,24 @@ def write_validation_report(
         f.write(f"records_decoded: {records_decoded}\n")
         f.write(f"records_matched: {records_matched}\n")
         f.write(f"records_filtered_out: {records_filtered_out}\n")
+        f.write(f"records_filter_evaluated: {records_filter_evaluated}\n")
+        f.write(f"records_filter_matched: {records_filter_matched}\n")
+        f.write(f"records_filter_filtered_out: {records_filter_filtered_out}\n")
         f.write("\n")
         f.write(f"Counter invariant: {'PASS' if invariant_ok else 'FAIL'}\n")
+        if time_window_applied:
+            f.write(
+                "Time-window invariant: "
+                f"{'PASS' if time_invariant_ok else 'FAIL'}\n"
+            )
+            f.write(
+                "Filter-evaluated/time-matched invariant: "
+                f"{'PASS' if filter_evaluated_matches_time_ok else 'FAIL'}\n"
+            )
+        f.write(
+            "Filter-stage invariant: "
+            f"{'PASS' if filter_invariant_ok else 'FAIL'}\n"
+        )
         f.write("\n")
         f.write("[Provenance validation]\n")
         f.write(
@@ -317,6 +376,9 @@ def write_validation_report(
         # final result
         overall_ok = (
             invariant_ok
+            and ((not time_window_applied) or time_invariant_ok)
+            and filter_invariant_ok
+            and filter_evaluated_matches_time_ok
             and all(t.get('succeeded') for t in trace_results)
             and component_provenance_ok
             and source_trace_path_provenance_ok
