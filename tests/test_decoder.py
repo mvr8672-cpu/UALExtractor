@@ -609,3 +609,134 @@ def test_filter_spec_missing_timestamp_with_active_time_filter_does_not_match() 
     filter_spec = FilterSpec.from_cli(start="2026-05-02T00:00:00Z")
     assert filter_spec.matches({"process": "SpringBoard"}) is False
     assert filter_spec.matches({"timestamp": "2026-05-02T00:00:00Z", "process": "SpringBoard"}) is True
+
+
+# ============================================================================
+# Sprint 9: decode_batch integration tests for --message filter
+# ============================================================================
+
+
+def test_decode_batch_message_filter_matches_only_message_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--message must match records where the message field contains the term."""
+    inspection = _inspection(tmp_path)
+    records = [
+        {
+            "timestamp": "2026-05-02T05:00:00Z",
+            "process": "springboard",
+            "pid": 1,
+            "subsystem": "com.apple.bt",
+            "category": "conn",
+            "event_type": "Log",
+            "log_type": "Info",
+            "message": "bluetooth session started",
+        },
+        {
+            "timestamp": "2026-05-02T05:00:01Z",
+            "process": "springboard",
+            "pid": 2,
+            "subsystem": "com.apple.bt",
+            "category": "conn",
+            "event_type": "Log",
+            "log_type": "Info",
+            "message": "wifi session started",
+        },
+    ]
+
+    def popen(command, stdout, stderr, text):
+        return _make_process([json.dumps(r) + "\n" for r in records])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume"],
+        output_path=tmp_path / "out.jsonl",
+        filter_spec=FilterSpec.from_cli(message=["bluetooth"]),
+    )
+
+    assert summary.records_decoded == 2
+    assert summary.records_matched == 1
+    assert summary.records_filtered_out == 1
+
+
+def test_decode_batch_message_filter_does_not_match_process_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--message must not match when 'bluetooth' appears only in process, not message."""
+    inspection = _inspection(tmp_path)
+    records = [
+        {
+            "timestamp": "2026-05-02T05:00:00Z",
+            "process": "bluetoothd",   # term here
+            "pid": 1,
+            "subsystem": "com.apple.bt",
+            "category": "conn",
+            "event_type": "Log",
+            "log_type": "Info",
+            "message": "unrelated message",  # not here
+        },
+    ]
+
+    def popen(command, stdout, stderr, text):
+        return _make_process([json.dumps(r) + "\n" for r in records])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume"],
+        output_path=tmp_path / "out.jsonl",
+        filter_spec=FilterSpec.from_cli(message=["bluetooth"]),
+    )
+
+    assert summary.records_decoded == 1
+    assert summary.records_matched == 0
+    assert summary.records_filtered_out == 1
+
+
+def test_decode_batch_message_filter_combined_with_contains_and_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--message AND --contains: both predicates must pass."""
+    inspection = _inspection(tmp_path)
+    records = [
+        {
+            # passes --message "session" AND --contains "bluetooth" (via process)
+            "timestamp": "2026-05-02T05:00:00Z",
+            "process": "bluetoothd",
+            "pid": 1,
+            "message": "session started",
+        },
+        {
+            # passes --contains "bluetooth" (via process) but not --message "session"
+            "timestamp": "2026-05-02T05:00:01Z",
+            "process": "bluetoothd",
+            "pid": 2,
+            "message": "unrelated",
+        },
+        {
+            # passes --message "session" but not --contains "bluetooth"
+            "timestamp": "2026-05-02T05:00:02Z",
+            "process": "springboard",
+            "pid": 3,
+            "message": "session started",
+        },
+    ]
+
+    def popen(command, stdout, stderr, text):
+        return _make_process([json.dumps(r) + "\n" for r in records])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+
+    summary = RustDecoder(tmp_path / "helper").decode_batch(
+        inspection,
+        ["HighVolume"],
+        output_path=tmp_path / "out.jsonl",
+        filter_spec=FilterSpec.from_cli(message=["session"], contains=["bluetooth"]),
+    )
+
+    assert summary.records_decoded == 3
+    assert summary.records_matched == 1
+    assert summary.records_filtered_out == 2

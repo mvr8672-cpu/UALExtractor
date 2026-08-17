@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from ualextractor.forensic import auto_output_paths, validate_output_provenance
+from ualextractor.filtering import FilterSpec
+from ualextractor.forensic import (
+    auto_output_paths,
+    choose_auto_output_descriptor,
+    sanitize_filename_component,
+    validate_output_provenance,
+)
 from ualextractor.main import main
 from ualextractor.decoder import RustDecoder
 from ualextractor.inspector.inspector import Inspector
@@ -45,6 +51,54 @@ class _FrozenDateTime:
     @staticmethod
     def now(tz=None):
         return datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def test_choose_auto_output_descriptor_prefers_message_before_contains_and_process() -> None:
+    assert choose_auto_output_descriptor(FilterSpec.from_cli(message=["bluetooth"])) == "bluetooth"
+    assert choose_auto_output_descriptor(FilterSpec.from_cli(contains=["bluetooth"])) == "bluetooth"
+    assert (
+        choose_auto_output_descriptor(
+            FilterSpec.from_cli(message=["bluetooth"], contains=["wifi"], process=["persist"])
+        )
+        == "bluetooth"
+    )
+    assert choose_auto_output_descriptor(FilterSpec.from_cli(process=["persist"])) == "persist"
+    assert choose_auto_output_descriptor(FilterSpec.from_cli()) is None
+
+
+def test_choose_auto_output_descriptor_sanitizes_and_falls_back_to_output(
+    monkeypatch,
+) -> None:
+    import ualextractor.forensic as forensic
+
+    monkeypatch.setattr(forensic, "datetime", _FrozenDateTime)
+
+    spec = FilterSpec.from_cli(message=["bluetooth / wifi"])
+    assert choose_auto_output_descriptor(spec) == "bluetooth / wifi"
+    assert sanitize_filename_component(choose_auto_output_descriptor(spec)) == "bluetooth___wifi"
+    assert choose_auto_output_descriptor(FilterSpec.from_cli()) is None
+
+    proposed, _ = forensic.propose_auto_output_paths(Path("/tmp/aael1871nl"), None, "csv")
+    assert proposed.parent.name.endswith("_output_2026-01-01")
+
+
+def test_auto_output_paths_share_same_descriptor_rules_between_dry_run_and_normal_decode(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import ualextractor.forensic as forensic
+
+    monkeypatch.setattr(forensic.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(forensic, "datetime", _FrozenDateTime)
+
+    spec = FilterSpec.from_cli(message=["bluetooth"], contains=["wifi"])
+    descriptor = choose_auto_output_descriptor(spec)
+    dry_out, dry_report = forensic.propose_auto_output_paths(tmp_path / "aael1871nl", descriptor, "csv")
+    out_path, report_path = forensic.auto_output_paths(tmp_path / "aael1871nl", descriptor, "csv")
+
+    assert descriptor == "bluetooth"
+    assert dry_out == out_path
+    assert dry_report == report_path
+    assert dry_out.parent.name == "UALExtractor_aael1871nl_bluetooth_2026-01-01"
 
 
 def _make_persist_dataset(root: Path) -> Path:
@@ -645,3 +699,80 @@ def test_downloads_unwritable_fails_before_decoder_starts_and_cleans_up(
     assert called is False
     assert "Downloads output is unavailable" in captured.err
     assert not extraction_dir.exists()
+
+
+# ============================================================================
+# Sprint 9: canonical filter summary reused in validation report
+# ============================================================================
+
+
+def test_filter_summary_appears_in_validation_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The canonical filter summary must appear verbatim in the validation report."""
+    root = _make_persist_dataset(tmp_path / "case")
+    records = [
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "process": "bluetoothd",
+            "pid": 1,
+            "message": "bluetooth message",
+        }
+    ]
+
+    def popen(command, stdout, stderr, text):
+        return _make_process([json.dumps(r) + "\n" for r in records])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+
+    output = tmp_path / "out.jsonl"
+    rc = main([
+        "decode",
+        str(root),
+        "--component", "Persist",
+        "--decoder", "helper",
+        "--output", str(output),
+        "--contains", "bluetooth",
+    ])
+    assert rc == 0
+
+    report_text = output.with_name("out_validation.txt").read_text(encoding="utf-8")
+    # The canonical filter section must use the single format_filter_summary() output.
+    # It must contain "contains:" and "bluetooth" (not the old ad-hoc repr).
+    assert "contains:" in report_text
+    assert "bluetooth" in report_text
+    # The old Python object repr style must not appear
+    assert "FilterSpec(" not in report_text
+
+
+def test_filter_summary_none_case_in_validation_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When no filters are active, validation report must say (none)."""
+    root = _make_persist_dataset(tmp_path / "case")
+    records = [
+        {
+            "timestamp": "2026-01-01T00:00:00Z",
+            "process": "springboard",
+            "pid": 1,
+            "message": "something",
+        }
+    ]
+
+    def popen(command, stdout, stderr, text):
+        return _make_process([json.dumps(r) + "\n" for r in records])
+
+    monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
+
+    output = tmp_path / "out.jsonl"
+    rc = main([
+        "decode",
+        str(root),
+        "--component", "Persist",
+        "--decoder", "helper",
+        "--output", str(output),
+    ])
+    assert rc == 0
+
+    report_text = output.with_name("out_validation.txt").read_text(encoding="utf-8")
+    assert "(none)" in report_text

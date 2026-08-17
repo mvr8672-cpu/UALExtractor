@@ -43,6 +43,8 @@ class FilterSpec:
     end: datetime | None = None
     start_is_date_only: bool = False
     end_is_date_only: bool = False
+    start_raw: str | None = None
+    end_raw: str | None = None
     process: tuple[str, ...] = ()
     pid: tuple[int, ...] = ()
     subsystem: tuple[str, ...] = ()
@@ -50,6 +52,7 @@ class FilterSpec:
     event_type: tuple[str, ...] = ()
     log_type: tuple[str, ...] = ()
     contains: tuple[str, ...] = ()
+    message: tuple[str, ...] = ()
 
     @classmethod
     def from_cli(
@@ -64,6 +67,7 @@ class FilterSpec:
         event_type: Sequence[str] | None = None,
         log_type: Sequence[str] | None = None,
         contains: Sequence[str] | None = None,
+        message: Sequence[str] | None = None,
     ) -> "FilterSpec":
         start_dt = None
         end_dt = None
@@ -94,6 +98,8 @@ class FilterSpec:
             end=end_dt,
             start_is_date_only=start_is_date_only,
             end_is_date_only=end_is_date_only,
+            start_raw=start,
+            end_raw=end,
             process=tuple(_as_lower(value) for value in (process or ())),
             pid=tuple(int(value) for value in (pid or ())),
             subsystem=tuple(_as_lower(value) for value in (subsystem or ())),
@@ -101,6 +107,7 @@ class FilterSpec:
             event_type=tuple(_as_lower(value) for value in (event_type or ())),
             log_type=tuple(_as_lower(value) for value in (log_type or ())),
             contains=tuple(_as_lower(value) for value in (contains or ())),
+            message=tuple(value.casefold() for value in (message or ())),
         )
 
     def matches(self, record: Mapping[str, Any]) -> bool:
@@ -145,6 +152,13 @@ class FilterSpec:
         ):
             return False
 
+        if self.message:
+            message_value = record.get("message")
+            if message_value is None or not any(
+                _text_matches(message_value, value) for value in self.message
+            ):
+                return False
+
         if self.contains:
             haystacks = (
                 record.get("message"),
@@ -185,3 +199,74 @@ class FilterSpec:
                 return False
 
         return True
+
+
+def format_filter_summary(spec: FilterSpec | None) -> str:
+    """
+    Format a FilterSpec as a canonical human-readable filter summary.
+
+    Used by:
+    - dry-run output
+    - normal decode stderr before first trace
+    - forensic validation report
+
+    If no filters are active, returns "(none)".
+    Otherwise returns a deterministic multi-line representation with:
+    - all filter types
+    - repeated values
+    - raw and effective time boundaries with semantics
+    - clear distinction between contains and message filters
+    """
+    if spec is None:
+        return "(none)"
+
+    parts = []
+
+    # Time bounds first
+    if spec.start is not None:
+        start_line = f"start: raw={spec.start_raw!r}"
+        if spec.start_is_date_only:
+            start_line += f", effective={spec.start.isoformat()}Z (inclusive)"
+        else:
+            start_line += f", effective={spec.start.isoformat()} (inclusive)"
+        parts.append(start_line)
+
+    if spec.end is not None:
+        end_line = f"end: raw={spec.end_raw!r}"
+        if spec.end_is_date_only:
+            end_upper = spec.end + timedelta(days=1)
+            end_line += f", effective={end_upper.isoformat()}Z (exclusive)"
+        else:
+            end_line += f", effective={spec.end.isoformat()} (inclusive)"
+        parts.append(end_line)
+
+    # Text search filters (message before contains)
+    if spec.message:
+        parts.append(f"message: {list(spec.message)}")
+
+    if spec.contains:
+        parts.append(f"contains: {list(spec.contains)}")
+
+    # Field-specific filters in deterministic order
+    if spec.process:
+        parts.append(f"process: {list(spec.process)}")
+
+    if spec.pid:
+        parts.append(f"pid: {list(spec.pid)}")
+
+    if spec.subsystem:
+        parts.append(f"subsystem: {list(spec.subsystem)}")
+
+    if spec.category:
+        parts.append(f"category: {list(spec.category)}")
+
+    if spec.event_type:
+        parts.append(f"event_type: {list(spec.event_type)}")
+
+    if spec.log_type:
+        parts.append(f"log_type: {list(spec.log_type)}")
+
+    if not parts:
+        return "(none)"
+
+    return "\n".join(parts)

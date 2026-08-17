@@ -7,7 +7,10 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from ualextractor.filtering import FilterSpec
 
 
 def _now_iso() -> str:
@@ -134,6 +137,42 @@ def _ensure_writable_extraction_directory(extraction_dir: Path) -> None:
             "Downloads output is unavailable: "
             f"cannot write inside planned extraction directory {extraction_dir}: {error}"
         ) from error
+
+
+def choose_auto_output_descriptor(filter_spec: "FilterSpec | None") -> Optional[str]:
+    """Return the first safe filename descriptor according to a fixed priority."""
+    if filter_spec is None:
+        return None
+
+    for values in (filter_spec.message, filter_spec.contains, filter_spec.process):
+        if values:
+            return values[0]
+    return None
+
+
+def propose_auto_output_paths(evidence_root: Path, descriptor: Optional[str], extension: str) -> tuple[Path, Path]:
+    """Calculate proposed output paths for dry-run, without creating any directories."""
+    home = Path.home()
+    downloads = home / "Downloads"
+
+    identifier = sanitize_filename_component(evidence_root.name)
+    descriptor_part = sanitize_filename_component(descriptor) if descriptor else "output"
+    date_part = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    base = f"{identifier}_{descriptor_part}_{date_part}"
+    extraction_dir_name = f"UALExtractor_{base}"
+    extraction_dir = downloads / extraction_dir_name
+
+    # collision safety occurs at extraction-directory level
+    i = 2
+    while extraction_dir.exists():
+        extraction_dir = downloads / f"{extraction_dir_name}_{i}"
+        i += 1
+
+    filename = f"{base}.{extension.lstrip('.')}"
+    out_path = extraction_dir / filename
+    report_path = extraction_dir / f"{base}_validation.txt"
+
+    return out_path, report_path
 
 
 def auto_output_paths(evidence_root: Path, descriptor: Optional[str], extension: str) -> tuple[Path, Path]:

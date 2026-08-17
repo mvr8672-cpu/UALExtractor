@@ -7,11 +7,13 @@ from pathlib import Path
 from typing import Sequence
 
 from ualextractor.decoder import BatchDecodeSummary, RustDecoder
-from ualextractor.filtering import FilterSpec
+from ualextractor.filtering import FilterSpec, format_filter_summary
 from ualextractor.forensic import (
     _now_iso,
     ForensicOutputError,
     auto_output_paths,
+    choose_auto_output_descriptor,
+    propose_auto_output_paths,
     validate_output_provenance,
     write_validation_report,
 )
@@ -100,6 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--event-type", action="append", default=[], help="event type exact filter; repeated values use OR")
     batch_parser.add_argument("--log-type", action="append", default=[], help="log type exact filter; repeated values use OR")
     batch_parser.add_argument("--contains", action="append", default=[], help="case-insensitive text search across message/process/subsystem/category; repeated values use OR")
+    batch_parser.add_argument("--message", action="append", default=[], help="case-insensitive text search of message field only; repeated values use OR")
     batch_parser.add_argument(
         "--format",
         choices=["jsonl", "csv"],
@@ -110,6 +113,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--downloads",
         action="store_true",
         help="automatic safe output naming under ~/Downloads when --output is not supplied",
+    )
+    batch_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="preflight-only: show what would be decoded without running the decoder",
     )
     return parser
 
@@ -206,7 +214,83 @@ def _build_filter_spec(args: argparse.Namespace) -> FilterSpec:
         event_type=args.event_type,
         log_type=args.log_type,
         contains=args.contains,
+        message=args.message,
     )
+
+
+def _run_dry_run(
+    root: Path,
+    components: list[str],
+    filter_spec: FilterSpec | None = None,
+    output_format: str = "jsonl",
+    downloads: bool = False,
+    output: Path | None = None,
+) -> int:
+    """Perform dry-run preflight without calling decoder or creating output."""
+    datasets = UFEDFinder().find_datasets(root)
+    if not datasets:
+        print(f"No valid UFED dataset found under: {root.expanduser()}", file=sys.stderr)
+        return 0
+    if len(datasets) > 1:
+        raise ValueError("decode requires a root containing exactly one dataset")
+
+    dataset = datasets[0]
+    inspector = Inspector()
+    inspection_result = inspector.inspect(dataset)
+
+    # Inventory traces
+    inventory = TraceInventoryScanner().scan(inspection_result)
+
+    # Filter inventory by requested components
+    selected_traces = []
+    total_bytes = 0
+    for trace_file in inventory.trace_files:
+        if trace_file.component in components:
+            selected_traces.append(trace_file)
+            total_bytes += trace_file.size_bytes
+
+    # Sort deterministically by path
+    selected_traces.sort(key=lambda t: t.path)
+
+    # Print dry-run report to stderr
+    print("DRY RUN — No decoder will be executed, no output will be created", file=sys.stderr)
+    print(f"Dataset: {dataset.dataset_root.name}", file=sys.stderr)
+    print(f"Evidence root: {dataset.dataset_root}", file=sys.stderr)
+    print(f"Components: {', '.join(components)}", file=sys.stderr)
+    print(f"Selected traces: {len(selected_traces)}", file=sys.stderr)
+    print(f"Selected bytes: {total_bytes}", file=sys.stderr)
+    print(f"Output format: {output_format}", file=sys.stderr)
+
+    # Print filter summary
+    filter_summary = format_filter_summary(filter_spec)
+    print(f"Filters: {filter_summary}", file=sys.stderr)
+
+    # Print each selected trace
+    print("Traces:", file=sys.stderr)
+    for trace in selected_traces:
+        print(f"  {trace.path} ({trace.size_bytes} bytes)", file=sys.stderr)
+
+    # Show proposed output path if explicitly provided
+    if output is not None:
+        report_path = output.with_name(output.stem + "_validation.txt")
+        print(f"Proposed output: {output}", file=sys.stderr)
+        print(f"Proposed report: {report_path}", file=sys.stderr)
+
+    # Show proposed Downloads behavior if requested
+    if downloads:
+        descriptor = choose_auto_output_descriptor(filter_spec)
+        ext = "csv" if output_format == "csv" else "jsonl"
+        try:
+            out_path, report_path = propose_auto_output_paths(root, descriptor, ext)
+            print(f"Proposed output: {out_path}", file=sys.stderr)
+            print(f"Proposed report: {report_path}", file=sys.stderr)
+        except ForensicOutputError as error:
+            print(f"Proposed output error: {error}", file=sys.stderr)
+
+    print("--force has no effect in dry-run mode (no output created)", file=sys.stderr)
+
+    return 0
+
 
 
 def _decode_root(
@@ -219,6 +303,7 @@ def _decode_root(
     filter_spec: FilterSpec | None = None,
     output_format: str = "jsonl",
     downloads: bool = False,
+    dry_run: bool = False,
 ) -> int:
     datasets = UFEDFinder().find_datasets(root)
     if not datasets:
@@ -227,13 +312,14 @@ def _decode_root(
     if len(datasets) > 1:
         raise ValueError("decode requires a root containing exactly one dataset")
 
+    # Handle dry-run mode before any decoder processing
+    if dry_run:
+        return _run_dry_run(root, components, filter_spec, output_format, downloads, output)
+
     report_path: Path | None = None
     # handle automatic Downloads naming if requested and no explicit output provided
     if output is None and downloads:
-        descriptor = None
-        if filter_spec is not None and filter_spec.contains:
-            # use first contains term as descriptor when present
-            descriptor = filter_spec.contains[0]
+        descriptor = choose_auto_output_descriptor(filter_spec)
         ext = "csv" if output_format == "csv" else "jsonl"
         try:
             out_path, report_path = auto_output_paths(root, descriptor, ext)
@@ -242,6 +328,9 @@ def _decode_root(
             return 1
         output = out_path
     execution_start = _now_iso()
+
+    # Print filter summary to stderr before decoding starts
+    print(f"Active filters: {format_filter_summary(filter_spec)}", file=sys.stderr)
 
     summary = RustDecoder(decoder_path).decode_batch(
         Inspector().inspect(datasets[0]),
@@ -270,15 +359,7 @@ def _decode_root(
 
         execution_end = _now_iso()
 
-        fs = filter_spec
-        if fs is not None:
-            fs_repr = (
-                f"start={fs.start!r}, end={fs.end!r}, process={fs.process}, pid={fs.pid}, "
-                f"subsystem={fs.subsystem}, category={fs.category}, event_type={fs.event_type}, "
-                f"log_type={fs.log_type}, contains={fs.contains}"
-            )
-        else:
-            fs_repr = "(none)"
+        fs_repr = format_filter_summary(filter_spec)
 
         provenance = validate_output_provenance(output, output_format)
 
@@ -355,6 +436,7 @@ def main(argv: Sequence[str] | None = None) -> int:
            filter_spec,
            args.format,
            args.downloads,
+           args.dry_run,
        )
     return 0
 
