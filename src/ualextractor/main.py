@@ -3,9 +3,21 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from ualextractor.compare import CompareSide, compare_record_sets
+from ualextractor.compare_io import (
+    CompareInputError,
+    CompareInputReadResult,
+    read_compare_input,
+)
+from ualextractor.compare_output import (
+    InputFileMetadata,
+    file_sha256,
+    write_comparison_package,
+)
 from ualextractor.decoder import BatchDecodeSummary, RustDecoder
 from ualextractor.filtering import FilterSpec, format_filter_summary
 from ualextractor.forensic import (
@@ -14,6 +26,7 @@ from ualextractor.forensic import (
     auto_output_paths,
     choose_auto_output_descriptor,
     propose_auto_output_paths,
+    sanitize_filename_component,
     validate_output_provenance,
     write_validation_report,
 )
@@ -119,6 +132,42 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="preflight-only: show what would be decoded without running the decoder",
     )
+    compare_parser = subparsers.add_parser(
+        "compare",
+        help="compare two extracted CSV/JSONL exports and write a comparison package",
+    )
+    compare_parser.add_argument("--left", type=Path, required=True, help="left input file")
+    compare_parser.add_argument("--right", type=Path, required=True, help="right input file")
+    compare_parser.add_argument(
+        "--left-format",
+        choices=["csv", "jsonl"],
+        help="optional explicit left input format override",
+    )
+    compare_parser.add_argument(
+        "--right-format",
+        choices=["csv", "jsonl"],
+        help="optional explicit right input format override",
+    )
+    compare_parser.add_argument(
+        "--output",
+        type=Path,
+        help="final comparison package directory",
+    )
+    compare_parser.add_argument(
+        "--downloads",
+        action="store_true",
+        help="write the comparison package to a safe automatically named directory under ~/Downloads",
+    )
+    compare_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing explicit comparison package directory",
+    )
+    compare_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate inputs, hash them, and report the proposed output directory without creating output files",
+    )
     return parser
 
 
@@ -216,6 +265,193 @@ def _build_filter_spec(args: argparse.Namespace) -> FilterSpec:
         contains=args.contains,
         message=args.message,
     )
+
+
+def _validate_compare_destination_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    if args.output is None and not args.downloads:
+        parser.error("either --output DIR or --downloads is required")
+    if args.output is not None and args.downloads:
+        parser.error("exactly one of --output DIR or --downloads must be supplied")
+
+
+def _read_compare_side(
+    *,
+    path: Path,
+    side: CompareSide,
+    format_override: str | None,
+) -> CompareInputReadResult:
+    resolved_path = path.resolve()
+    if not resolved_path.exists():
+        raise CompareInputError(f"{side.title()} input file does not exist: {resolved_path}")
+    if not resolved_path.is_file():
+        raise CompareInputError(
+            f"{side.title()} input path is not a regular file: {resolved_path}"
+        )
+    return read_compare_input(
+        path=resolved_path,
+        side=side,
+        format_override=format_override,
+    )
+
+
+def _build_compare_input_metadata(read_result: CompareInputReadResult) -> InputFileMetadata:
+    source_path = read_result.source_path.resolve()
+    return InputFileMetadata(
+        path=source_path,
+        detected_format=read_result.source_format,
+        size_bytes=source_path.stat().st_size,
+        sha256=file_sha256(source_path),
+    )
+
+
+def _safe_compare_stem(path: Path, fallback: str) -> str:
+    sanitized = sanitize_filename_component(path.stem)
+    return sanitized or fallback
+
+
+def _propose_compare_downloads_directory(
+    left_path: Path, right_path: Path
+) -> tuple[Path, bool]:
+    downloads_dir = Path.home() / "Downloads"
+    date_part = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    base_name = (
+        "UALExtractor_compare_"
+        f"{_safe_compare_stem(left_path, 'left')}_"
+        f"{_safe_compare_stem(right_path, 'right')}_"
+        f"{date_part}"
+    )
+    candidate = downloads_dir / base_name
+    collision_applied = False
+    suffix = 2
+    while candidate.exists():
+        collision_applied = True
+        candidate = downloads_dir / f"{base_name}_{suffix}"
+        suffix += 1
+    return candidate.resolve(), collision_applied
+
+
+def _resolve_compare_destination(
+    *, left_path: Path, right_path: Path, args: argparse.Namespace
+) -> tuple[Path, bool]:
+    if args.output is not None:
+        destination_dir = args.output.resolve()
+        left_resolved = left_path.resolve()
+        right_resolved = right_path.resolve()
+        if destination_dir == left_resolved or destination_dir == right_resolved:
+            raise ValueError("output directory must not overwrite an input file")
+        return destination_dir, False
+    return _propose_compare_downloads_directory(left_path, right_path)
+
+
+def _print_compare_dry_run(
+    *,
+    left_meta: InputFileMetadata,
+    right_meta: InputFileMetadata,
+    destination_dir: Path,
+    destination_exists: bool,
+    collision_applied: bool,
+) -> None:
+    print("DRY RUN", file=sys.stderr)
+    print(f"Left input: {left_meta.path.resolve()}", file=sys.stderr)
+    print(f"Left detected format: {left_meta.detected_format}", file=sys.stderr)
+    print(f"Left size bytes: {left_meta.size_bytes}", file=sys.stderr)
+    print(f"Left SHA-256: {left_meta.sha256}", file=sys.stderr)
+    print("Left structural validity: PASS", file=sys.stderr)
+    print(f"Right input: {right_meta.path.resolve()}", file=sys.stderr)
+    print(f"Right detected format: {right_meta.detected_format}", file=sys.stderr)
+    print(f"Right size bytes: {right_meta.size_bytes}", file=sys.stderr)
+    print(f"Right SHA-256: {right_meta.sha256}", file=sys.stderr)
+    print("Right structural validity: PASS", file=sys.stderr)
+    print(f"Proposed output directory: {destination_dir}", file=sys.stderr)
+    print(f"Destination exists: {'YES' if destination_exists else 'NO'}", file=sys.stderr)
+    print(
+        f"Collision naming applied: {'YES' if collision_applied else 'NO'}",
+        file=sys.stderr,
+    )
+    print("No comparison output files created.", file=sys.stderr)
+
+
+def _run_compare(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    _validate_compare_destination_args(parser, args)
+    try:
+        left_result = _read_compare_side(
+            path=args.left,
+            side="left",
+            format_override=args.left_format,
+        )
+        right_result = _read_compare_side(
+            path=args.right,
+            side="right",
+            format_override=args.right_format,
+        )
+        destination_dir, collision_applied = _resolve_compare_destination(
+            left_path=left_result.source_path,
+            right_path=right_result.source_path,
+            args=args,
+        )
+        left_meta = _build_compare_input_metadata(left_result)
+        right_meta = _build_compare_input_metadata(right_result)
+    except CompareInputError as error:
+        message = str(error)
+        if args.dry_run:
+            if "Left input" in message or "left input" in message:
+                parser.error(f"Left structural validity: FAIL - {message}")
+            if "Right input" in message or "right input" in message:
+                parser.error(f"Right structural validity: FAIL - {message}")
+            parser.error(f"structural validity: FAIL - {message}")
+        parser.error(message)
+    except ValueError as error:
+        parser.error(str(error))
+    except OSError as error:
+        parser.error(str(error))
+
+    if args.dry_run:
+        _print_compare_dry_run(
+            left_meta=left_meta,
+            right_meta=right_meta,
+            destination_dir=destination_dir,
+            destination_exists=destination_dir.exists(),
+            collision_applied=collision_applied,
+        )
+        return 0
+
+    result = compare_record_sets(list(left_result.records), list(right_result.records))
+
+    try:
+        write_comparison_package(
+            result=result,
+            left_input=left_meta,
+            right_input=right_meta,
+            destination_dir=destination_dir,
+            replace_existing=bool(args.output is not None and args.force),
+        )
+    except ValueError as error:
+        if str(error) == "destination directory must not match either input file":
+            parser.error("output directory must not overwrite an input file")
+        parser.error(str(error))
+    except FileExistsError as error:
+        message = str(error)
+        if args.output is not None and not args.force:
+            parser.error(f"{message}. Use --force to overwrite.")
+        parser.error(message)
+    except OSError as error:
+        parser.error(str(error))
+
+    print(f"Comparison package directory: {destination_dir}", file=sys.stderr)
+    if args.downloads and args.force:
+        print(
+            "--force has no effect with --downloads; the next available directory is selected.",
+            file=sys.stderr,
+        )
+    if not result.invariants.all_ok:
+        print(
+            "Comparison invariants failed; see comparison_summary.txt for VALIDATION: FAIL.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def _run_dry_run(
@@ -460,13 +696,14 @@ def _decode_root(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
     if args.command == "inspect":
-        return _inspect_root(args.root)
+       return _inspect_root(args.root)
     if args.command == "inventory":
-        return _inventory_root(args.root)
+       return _inventory_root(args.root)
     if args.command == "decode-poc":
-        return _decode_poc_root(args.root, args.decoder)
+       return _decode_poc_root(args.root, args.decoder)
     if args.command == "decode":
        filter_spec = _build_filter_spec(args)
        return _decode_root(
@@ -481,6 +718,8 @@ def main(argv: Sequence[str] | None = None) -> int:
            args.downloads,
            args.dry_run,
        )
+    if args.command == "compare":
+       return _run_compare(parser, args)
     return 0
 
 
