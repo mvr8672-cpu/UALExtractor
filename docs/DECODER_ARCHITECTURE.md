@@ -181,3 +181,38 @@ The invariant holds:
   multiple traces internally.
 - The batch decoder requires a single UFED dataset root and does not span
   multiple dataset roots in one invocation.
+
+## Sprint 11 real-data validation acceptance
+
+Sprint 11 is accepted/pass based on the approved real-data criterion:
+
+- validation compares shared semantic information between sources, not the
+  limitations of `log show --style compact`
+- UALExtractor must not lose relevant information present in the historical
+  reference records
+- UALExtractor may include additional records, additional decoded fields, and
+  higher timestamp precision
+
+Real-data validation outcomes for the accepted run:
+
+- all 532 selected traces decoded successfully (`traces succeeded: 532`,
+  `traces failed: 0`)
+- `records_decoded: 21,127,828`
+- `records_matched: 6,444,127`
+- `records_time_invalid: 0`
+- decode validation report: `PASS`
+- historical timestamp-bearing lines were fully accounted for
+- shared-content matching using
+  `(message, basename(process), pid, subsystem, category)` produced 79,840
+  unique identities distributed across early, middle, and late portions of the
+  historical interval
+
+The historical compact reference contains fewer records than the UALExtractor
+export. This validation does not treat record-count equality as proof of 100%
+historical coverage; instead, it uses shared-content evidence across the full
+historical interval.
+
+One contradictory timestamp-offset match was observed during offset inference.
+Per accepted Sprint 11 criteria, exact historical timezone reconstruction is
+not required for acceptance, and no decoder behavior changes are required to
+mimic compact-export limitations.
