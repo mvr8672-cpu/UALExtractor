@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -66,6 +67,24 @@ def get_version(package_name: str) -> Optional[str]:
 def sanitize_filename_component(s: str) -> str:
     # simple sanitizer: keep alphanum, dash, underscore; replace others with _
     return "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in s)
+
+
+def get_user_downloads_dir() -> Path:
+    """Resolve the platform-appropriate user Downloads directory without hard-coded POSIX assumptions."""
+    if os.name == "nt":
+        for env_name in ("USERPROFILE", "HOMEDRIVE"):
+            value = os.environ.get(env_name)
+            if value:
+                candidate = Path(value)
+                downloads = candidate / "Downloads"
+                if candidate.exists() or env_name == "USERPROFILE":
+                    return downloads
+        home = Path.home()
+        downloads = home / "Downloads"
+        return downloads
+
+    home = Path.home()
+    return home / "Downloads"
 
 
 def _is_populated_string(value: object) -> bool:
@@ -154,8 +173,7 @@ def choose_auto_output_descriptor(filter_spec: "FilterSpec | None") -> Optional[
 
 def propose_auto_output_paths(evidence_root: Path, descriptor: Optional[str], extension: str) -> tuple[Path, Path]:
     """Calculate proposed output paths for dry-run, without creating any directories."""
-    home = Path.home()
-    downloads = home / "Downloads"
+    downloads = get_user_downloads_dir()
 
     identifier = sanitize_filename_component(evidence_root.name)
     descriptor_part = sanitize_filename_component(descriptor) if descriptor else "output"
@@ -178,9 +196,8 @@ def propose_auto_output_paths(evidence_root: Path, descriptor: Optional[str], ex
 
 
 def auto_output_paths(evidence_root: Path, descriptor: Optional[str], extension: str) -> tuple[Path, Path]:
-    # Determine ~/Downloads, ensure it exists
-    home = Path.home()
-    downloads = home / "Downloads"
+    # Determine the platform-appropriate user Downloads directory and ensure it exists.
+    downloads = get_user_downloads_dir()
     try:
         downloads.mkdir(parents=True, exist_ok=True)
     except OSError as error:

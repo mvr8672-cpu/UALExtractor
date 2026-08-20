@@ -328,3 +328,26 @@ conclusion from the audited Phase E cases is:
 The comparator therefore reports forensic coverage honestly: it distinguishes
 strict coverage from representation-only context matches and preserves a clear
 separation between semantic loss and historical rendering differences.
+
+## Sprint 13 Windows compatibility
+
+UALExtractor is designed to be cross-platform at the Python orchestration layer
+while retaining the macOS-first decoder backend used by the UFED trace helper.
+The supported Python code path intentionally avoids OS-specific assumptions in
+shared logic:
+
+- path handling uses `pathlib.Path` and explicit user-directory resolution rather
+  than hard-coded `/tmp`, `/Users/...`, or POSIX-only separators in production code
+- decoder invocation uses argument lists rather than shell interpolation and
+  accepts Windows `.exe` naming conventions without assuming executable-bit
+  semantics on Unix
+- Downloads output resolution uses the platform-appropriate user profile or
+  home directory, rather than a macOS-only `~/Downloads` assumption in the logic
+- validation and reporting remain on stderr/stdout separation so machine-readable
+  output stays clean across hosts
+- SQLite-backed semantic coverage remains disk-backed and reusable, with cleanup
+  handled deterministically without POSIX-only locking assumptions
+
+Windows compatibility work is therefore focused on Python orchestration,
+path safety, subprocess invocation, output packaging, and deterministic reporting,
+without changing decoder semantics or weakening evidence-safety rules.

@@ -5,7 +5,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PosixPath
 
 import pytest
 
@@ -13,6 +13,7 @@ from ualextractor.filtering import FilterSpec
 from ualextractor.forensic import (
     auto_output_paths,
     choose_auto_output_descriptor,
+    get_user_downloads_dir,
     sanitize_filename_component,
     validate_output_provenance,
 )
@@ -101,6 +102,29 @@ def test_auto_output_paths_share_same_descriptor_rules_between_dry_run_and_norma
     assert dry_out == out_path
     assert dry_report == report_path
     assert dry_out.parent.name == "UALExtractor_aael1871nl_bluetooth_2026-01-01"
+
+
+def test_get_user_downloads_dir_uses_windows_profile(monkeypatch, tmp_path):
+    import ualextractor.forensic as forensic
+
+    monkeypatch.setattr(forensic, "Path", PosixPath)
+    monkeypatch.setattr(forensic.os, "name", "nt")
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("HOME", raising=False)
+
+    assert get_user_downloads_dir() == tmp_path / "Downloads"
+
+
+def test_decoder_accepts_windows_executable_name(monkeypatch, tmp_path):
+    from ualextractor.decoder import RustDecoder, _resolve_decoder_executable
+
+    exe_path = tmp_path / "ualextractor-decoder.exe"
+    exe_path.write_bytes(b"binary")
+    monkeypatch.setattr("ualextractor.decoder.os.name", "nt")
+
+    resolved = _resolve_decoder_executable(tmp_path / "ualextractor-decoder")
+    assert resolved == exe_path
+    assert RustDecoder(tmp_path / "ualextractor-decoder").executable == exe_path
 
 
 def _make_persist_dataset(root: Path) -> Path:

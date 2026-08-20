@@ -29,6 +29,7 @@ from ualextractor.forensic import (
     ForensicOutputError,
     auto_output_paths,
     choose_auto_output_descriptor,
+    get_user_downloads_dir,
     propose_auto_output_paths,
     sanitize_filename_component,
     validate_output_provenance,
@@ -380,7 +381,7 @@ def _safe_compare_stem(path: Path, fallback: str) -> str:
 def _propose_compare_downloads_directory(
     left_path: Path, right_path: Path
 ) -> tuple[Path, bool]:
-    downloads_dir = Path.home() / "Downloads"
+    downloads_dir = get_user_downloads_dir()
     date_part = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     base_name = (
         "UALExtractor_compare_"
