@@ -216,3 +216,115 @@ One contradictory timestamp-offset match was observed during offset inference.
 Per accepted Sprint 11 criteria, exact historical timezone reconstruction is
 not required for acceptance, and no decoder behavior changes are required to
 mimic compact-export limitations.
+
+## Sprint 12 semantic coverage comparator
+
+Sprint 12 adds a directional semantic coverage comparator:
+
+- command: `compare-semantic`
+- question answered:
+  "Is the relevant shared information in the reference dataset also present in
+  the UALExtractor output?"
+
+This comparator is intentionally different from byte-level diffing:
+
+- no requirement for identical record counts
+- no requirement for identical timestamp precision
+- no requirement for identical field sets or provenance fields
+- no requirement for identical formatting
+- UALExtractor may contain additional records and richer metadata
+
+### Direction and PASS semantics
+
+Coverage is directional: `REFERENCE -> UALEXTRACTOR`.
+
+Each reference record is classified as exactly one of:
+
+- `matched`
+- `unmatched`
+- `ambiguous`
+- `invalid`
+
+Default semantic PASS requires:
+
+- `reference unmatched = 0`
+- `reference ambiguous = 0`
+- `reference invalid = 0`
+
+Additional UALExtractor records are reported separately and do not reduce
+coverage.
+
+### Identity and normalization
+
+Default identity tuple:
+
+- `message`
+- `basename(process)`
+- normalized `pid`
+- `subsystem`
+- `category`
+
+The process basename rule covers the validated Sprint 11 case where
+`/absolute/path/to/process` and `process` represent the same process identity.
+
+`source_trace_path`, `component`, `timestamp`, and `tid` are not mandatory
+identity fields by default.
+
+### Timestamp handling
+
+Timestamp comparison is independent of semantic-content matching:
+
+- original timestamp text is preserved
+- timezone-aware values are compared exactly and with precision normalization
+- timezone is never inferred for naive timestamps
+- timestamp status is reported separately (`exact`,
+  `precision_normalized_match`, `different`, `unknown_not_comparable`)
+
+This allows outcomes such as:
+
+- content match: yes
+- timestamp match: no or unknown
+
+without classifying shared semantic content as missing.
+
+### Ambiguity and duplicates
+
+The comparator does not silently choose arbitrary candidates.
+Non-unique identity groups are explicitly reported as ambiguous for reference
+coverage decisions.
+
+This implements the accepted principle from Sprint 11:
+compare shared semantic information, not limitations of historical
+`log show --style compact` output.
+
+## Sprint 12 Phase E findings and comparator finalization
+
+The Phase E real-data investigation concluded that the historical compact export
+is useful as a historical reference, but it is not a canonical equality oracle for
+UALExtractor records. The comparator must therefore remain strict about true
+semantic identity while separately reporting representation-only uncertainty.
+
+The approved result model is:
+
+- `STRICT_SEMANTIC_MATCH`: shared semantic identity matches under the approved
+  deterministic normalization.
+- `MISSING_REFERENCE_OCCURRENCE`: reference multiplicity exceeds UALExtractor
+  multiplicity for the strict semantic identity.
+- `REPRESENTATION_DIFFERENCE_CONTEXT_PRESENT`: the process/pid/subsystem/category
+  context exists in UALExtractor, but the literal message text does not match the
+  reference exactly. This is diagnostic evidence only and must not silently become
+  a strict match.
+- `INVALID_REFERENCE`: the reference record cannot be canonicalized.
+- `UAL_ADDITIONAL`: UALExtractor contains extra records beyond the reference set.
+
+The comparator remains intentionally strict and does not adopt fuzzy matching,
+substring matching, or global compact-output normalization. The approved
+conclusion from the audited Phase E cases is:
+
+> No probable decoder information loss was identified in the audited Phase E
+> cases; however, the historical compact export cannot serve as a universal
+> literal-message equality oracle.
+
+The comparator therefore reports forensic coverage honestly: it distinguishes
+strict coverage from representation-only context matches and preserves a clear
+separation between semantic loss and historical rendering differences.

@@ -5,12 +5,13 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 from ualextractor.compare import CompareSide, compare_record_sets
 from ualextractor.compare_io import (
     CompareInputError,
     CompareInputReadResult,
+    detect_input_format,
     read_compare_input,
 )
 from ualextractor.compare_output import (
@@ -18,6 +19,9 @@ from ualextractor.compare_output import (
     file_sha256,
     write_comparison_package,
 )
+from ualextractor.compare_semantic_io import scan_semantic_input
+from ualextractor.compare_semantic_output import write_semantic_coverage_package
+from ualextractor.compare_semantic_sqlite import run_semantic_coverage_sqlite
 from ualextractor.decoder import BatchDecodeSummary, RustDecoder
 from ualextractor.filtering import FilterSpec, format_filter_summary
 from ualextractor.forensic import (
@@ -168,6 +172,51 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate inputs, hash them, and report the proposed output directory without creating output files",
     )
+    semantic_compare_parser = subparsers.add_parser(
+        "compare-semantic",
+        help="directional semantic coverage comparison from reference to UALExtractor",
+    )
+    semantic_compare_parser.add_argument(
+        "--reference", type=Path, required=True, help="reference input file"
+    )
+    semantic_compare_parser.add_argument(
+        "--ualextractor", type=Path, required=True, help="UALExtractor input file"
+    )
+    semantic_compare_parser.add_argument(
+        "--reference-format",
+        choices=["csv", "jsonl"],
+        help="optional explicit reference input format override",
+    )
+    semantic_compare_parser.add_argument(
+        "--ualextractor-format",
+        choices=["csv", "jsonl"],
+        help="optional explicit UALExtractor input format override",
+    )
+    semantic_compare_parser.add_argument(
+        "--output",
+        type=Path,
+        help="final semantic coverage package directory",
+    )
+    semantic_compare_parser.add_argument(
+        "--downloads",
+        action="store_true",
+        help="write the semantic coverage package to a safe automatically named directory under ~/Downloads",
+    )
+    semantic_compare_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing explicit semantic coverage package directory",
+    )
+    semantic_compare_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate inputs, hash them, and report the proposed output directory without creating output files",
+    )
+    semantic_compare_parser.add_argument(
+        "--sqlite-index",
+        type=Path,
+        help="optional SQLite index path for disk-backed semantic coverage reuse",
+    )
     return parser
 
 
@@ -296,6 +345,23 @@ def _read_compare_side(
     )
 
 
+def _read_semantic_side(
+    *,
+    path: Path,
+    side: Literal["reference", "ualextractor"],
+    format_override: str | None,
+) -> tuple[Path, str]:
+    resolved_path = path.resolve()
+    if not resolved_path.exists():
+        raise CompareInputError(f"{side.title()} input file does not exist: {resolved_path}")
+    if not resolved_path.is_file():
+        raise CompareInputError(
+            f"{side.title()} input path is not a regular file: {resolved_path}"
+        )
+    source_format = detect_input_format(resolved_path, format_override)
+    return resolved_path, source_format
+
+
 def _build_compare_input_metadata(read_result: CompareInputReadResult) -> InputFileMetadata:
     source_path = read_result.source_path.resolve()
     return InputFileMetadata(
@@ -373,6 +439,37 @@ def _print_compare_dry_run(
     print("No comparison output files created.", file=sys.stderr)
 
 
+def _print_semantic_compare_dry_run(
+    *,
+    reference_meta: InputFileMetadata,
+    ualextractor_meta: InputFileMetadata,
+    destination_dir: Path,
+    destination_exists: bool,
+    collision_applied: bool,
+) -> None:
+    print("DRY RUN", file=sys.stderr)
+    print(f"Reference input: {reference_meta.path.resolve()}", file=sys.stderr)
+    print(f"Reference detected format: {reference_meta.detected_format}", file=sys.stderr)
+    print(f"Reference size bytes: {reference_meta.size_bytes}", file=sys.stderr)
+    print(f"Reference SHA-256: {reference_meta.sha256}", file=sys.stderr)
+    print("Reference structural validity: PASS", file=sys.stderr)
+    print(f"UALExtractor input: {ualextractor_meta.path.resolve()}", file=sys.stderr)
+    print(
+        f"UALExtractor detected format: {ualextractor_meta.detected_format}",
+        file=sys.stderr,
+    )
+    print(f"UALExtractor size bytes: {ualextractor_meta.size_bytes}", file=sys.stderr)
+    print(f"UALExtractor SHA-256: {ualextractor_meta.sha256}", file=sys.stderr)
+    print("UALExtractor structural validity: PASS", file=sys.stderr)
+    print(f"Proposed output directory: {destination_dir}", file=sys.stderr)
+    print(f"Destination exists: {'YES' if destination_exists else 'NO'}", file=sys.stderr)
+    print(
+        f"Collision naming applied: {'YES' if collision_applied else 'NO'}",
+        file=sys.stderr,
+    )
+    print("No semantic coverage output files created.", file=sys.stderr)
+
+
 def _run_compare(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     _validate_compare_destination_args(parser, args)
     try:
@@ -448,6 +545,130 @@ def _run_compare(parser: argparse.ArgumentParser, args: argparse.Namespace) -> i
     if not result.invariants.all_ok:
         print(
             "Comparison invariants failed; see comparison_summary.txt for VALIDATION: FAIL.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def _run_semantic_compare(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    _validate_compare_destination_args(parser, args)
+    try:
+        reference_path, reference_format = _read_semantic_side(
+            path=args.reference,
+            side="reference",
+            format_override=args.reference_format,
+        )
+        ualextractor_path, ualextractor_format = _read_semantic_side(
+            path=args.ualextractor,
+            side="ualextractor",
+            format_override=args.ualextractor_format,
+        )
+        destination_dir, collision_applied = _resolve_compare_destination(
+            left_path=reference_path,
+            right_path=ualextractor_path,
+            args=args,
+        )
+        reference_meta = InputFileMetadata(
+            path=reference_path,
+            detected_format=reference_format,
+            size_bytes=reference_path.stat().st_size,
+            sha256=file_sha256(reference_path),
+        )
+        ualextractor_meta = InputFileMetadata(
+            path=ualextractor_path,
+            detected_format=ualextractor_format,
+            size_bytes=ualextractor_path.stat().st_size,
+            sha256=file_sha256(ualextractor_path),
+        )
+    except CompareInputError as error:
+        message = str(error)
+        if args.dry_run:
+            if "Reference input" in message or "reference input" in message:
+                parser.error(f"Reference structural validity: FAIL - {message}")
+            if "UALExtractor input" in message or "ualextractor input" in message:
+                parser.error(f"UALExtractor structural validity: FAIL - {message}")
+            parser.error(f"structural validity: FAIL - {message}")
+        parser.error(message)
+    except ValueError as error:
+        parser.error(str(error))
+    except OSError as error:
+        parser.error(str(error))
+
+    if args.dry_run:
+        _print_semantic_compare_dry_run(
+            reference_meta=reference_meta,
+            ualextractor_meta=ualextractor_meta,
+            destination_dir=destination_dir,
+            destination_exists=destination_dir.exists(),
+            collision_applied=collision_applied,
+        )
+        try:
+            scan_semantic_input(
+                path=reference_meta.path,
+                side="reference",
+                format_override=args.reference_format,
+            )
+            scan_semantic_input(
+                path=ualextractor_meta.path,
+                side="ualextractor",
+                format_override=args.ualextractor_format,
+            )
+        except CompareInputError as error:
+            parser.error(f"structural validity: FAIL - {error}")
+        return 0
+
+    sqlite_index_path = args.sqlite_index
+    if sqlite_index_path is None:
+        sqlite_index_path = destination_dir / "semantic_index.sqlite3"
+    else:
+        sqlite_index_path = sqlite_index_path.resolve()
+
+    result = run_semantic_coverage_sqlite(
+        reference_input=reference_meta,
+        ualextractor_input=ualextractor_meta,
+        reference_format_override=args.reference_format,
+        ualextractor_format_override=args.ualextractor_format,
+        sqlite_db_path=sqlite_index_path,
+    )
+    try:
+        write_semantic_coverage_package(
+            result=result,
+            reference_input=reference_meta,
+            ualextractor_input=ualextractor_meta,
+            destination_dir=destination_dir,
+            replace_existing=bool(args.output is not None and args.force),
+        )
+    except ValueError as error:
+        if str(error) == "destination directory must not match either input file":
+            parser.error("output directory must not overwrite an input file")
+        parser.error(str(error))
+    except FileExistsError as error:
+        message = str(error)
+        if args.output is not None and not args.force:
+            parser.error(f"{message}. Use --force to overwrite.")
+        parser.error(message)
+    except OSError as error:
+        parser.error(str(error))
+
+    print(f"Semantic coverage package directory: {destination_dir}", file=sys.stderr)
+    print(f"Semantic SQLite index: {result.sqlite_db_path}", file=sys.stderr)
+    if result.ual_index_reused:
+        print("Semantic SQLite index reuse: YES", file=sys.stderr)
+    else:
+        print("Semantic SQLite index reuse: NO (rebuilt)", file=sys.stderr)
+    print(
+        f"Semantic SQLite index build seconds: {result.ual_index_build_seconds:.6f}",
+        file=sys.stderr,
+    )
+    if args.downloads and args.force:
+        print(
+            "--force has no effect with --downloads; the next available directory is selected.",
+            file=sys.stderr,
+        )
+    if not result.pass_semantic_coverage:
+        print(
+            "Semantic coverage validation failed; see semantic_coverage_summary.txt for PASS = NO.",
             file=sys.stderr,
         )
         return 1
@@ -720,6 +941,8 @@ def main(argv: Sequence[str] | None = None) -> int:
        )
     if args.command == "compare":
        return _run_compare(parser, args)
+    if args.command == "compare-semantic":
+       return _run_semantic_compare(parser, args)
     return 0
 
 
