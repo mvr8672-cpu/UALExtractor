@@ -25,7 +25,13 @@ def _base_record(**overrides: object) -> dict[str, object]:
     return record
 
 
-def _write_csv(path: Path, rows: list[dict[str, object]], header: list[str] | None = None) -> None:
+def _write_csv(
+    path: Path,
+    rows: list[dict[str, object]],
+    header: list[str] | None = None,
+    *,
+    encoding: str = "utf-8",
+) -> None:
     if header is None:
         header = [
             "timestamp",
@@ -39,15 +45,15 @@ def _write_csv(path: Path, rows: list[dict[str, object]], header: list[str] | No
             "component",
             "source_trace_path",
         ]
-    with path.open("w", encoding="utf-8", newline="") as handle:
+    with path.open("w", encoding=encoding, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=header, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
 
 
-def _write_jsonl(path: Path, rows: list[object]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
+def _write_jsonl(path: Path, rows: list[object], *, encoding: str = "utf-8") -> None:
+    with path.open("w", encoding=encoding, newline="") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -105,6 +111,55 @@ def test_csv_and_jsonl_canonical_equivalence_and_provenance_exclusion(
     assert left.records[0].component == "Persist"
     assert right.records[0].component == "OtherSource"
     assert exact_match_key(left.records[0]) == exact_match_key(right.records[0])
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_jsonl_input_accepts_utf8_with_and_without_bom_and_preserves_unicode(
+    tmp_path: Path, encoding: str
+) -> None:
+    jsonl_path = tmp_path / "left.jsonl"
+    _write_jsonl(
+        jsonl_path,
+        [
+            _base_record(
+                process="ProcessΩ",
+                message="Tweede regel β",
+            )
+        ],
+        encoding=encoding,
+    )
+
+    result = read_compare_input(path=jsonl_path, side="left")
+    record = result.records[0]
+    assert record.is_valid is True
+    assert record.source_record_number == 1
+    assert record.process == "ProcessΩ"
+    assert record.message == "Tweede regel β"
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_csv_input_accepts_utf8_with_and_without_bom_and_preserves_unicode(
+    tmp_path: Path, encoding: str
+) -> None:
+    csv_path = tmp_path / "left.csv"
+    _write_csv(
+        csv_path,
+        [
+            _base_record(
+                process="ProcessΩ",
+                message='Bluetooth  Device "β"',
+            )
+        ],
+        encoding=encoding,
+    )
+
+    result = read_compare_input(path=csv_path, side="left")
+    record = result.records[0]
+    assert record.is_valid is True
+    assert record.source_record_number == 1
+    assert record.original_timestamp_text == "2026-05-04T12:00:00.123456701Z"
+    assert record.process == "ProcessΩ"
+    assert record.message == 'Bluetooth  Device "β"'
 
 
 def test_utf8_case_and_whitespace_are_preserved(tmp_path: Path) -> None:

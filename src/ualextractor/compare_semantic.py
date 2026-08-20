@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,9 +78,7 @@ def normalize_pid(value: Any) -> int:
 def normalize_process_basename(value: str | None) -> str | None:
     if value is None:
         return None
-    if "/" not in value:
-        return value
-    basename = os.path.basename(value)
+    basename = value.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
     return basename if basename else value
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import subprocess
 import sys
 import time
@@ -87,11 +88,22 @@ class BatchDecodeSummary:
     elapsed_seconds: float
 
 
+def _resolve_decoder_executable(executable: Path) -> Path:
+    candidate = executable.expanduser()
+
+    if os.name == "nt" and candidate.suffix.lower() != ".exe":
+        fallback = candidate.with_suffix(".exe")
+        if fallback.name != candidate.name:
+            return fallback
+
+    return candidate
+
+
 class RustDecoder:
     """Invoke the cross-platform Mandiant decoder helper for one trace file."""
 
     def __init__(self, executable: Path) -> None:
-        self.executable = executable
+        self.executable = _resolve_decoder_executable(executable)
 
     def decode_one(
         self,
