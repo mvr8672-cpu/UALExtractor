@@ -68,7 +68,7 @@ def read_compare_input(
 
 
 def _read_csv_records(*, path: Path, side: CompareSide) -> Iterable[CanonicalComparisonRecord]:
-    with path.open("r", encoding="utf-8", newline="") as handle:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.reader(handle, strict=True)
         try:
             header = next(reader)
@@ -120,7 +120,7 @@ def _read_csv_records(*, path: Path, side: CompareSide) -> Iterable[CanonicalCom
 def _read_jsonl_records(
     *, path: Path, side: CompareSide
 ) -> Iterable[CanonicalComparisonRecord]:
-    with path.open("r", encoding="utf-8", newline="") as handle:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
             text = raw_line.strip()
             if not text:

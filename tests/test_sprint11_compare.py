@@ -37,7 +37,13 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_csv(path: Path, rows: list[dict[str, object]], *, header: list[str] | None = None) -> None:
+def _write_csv(
+    path: Path,
+    rows: list[dict[str, object]],
+    *,
+    header: list[str] | None = None,
+    encoding: str = "utf-8",
+) -> None:
     if header is None:
         fieldnames = list(REQUIRED_COMPARE_FIELDS)
         for row in rows:
@@ -46,15 +52,15 @@ def _write_csv(path: Path, rows: list[dict[str, object]], *, header: list[str] |
                     fieldnames.append(key)
     else:
         fieldnames = header
-    with path.open("w", encoding="utf-8", newline="") as handle:
+    with path.open("w", encoding=encoding, newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
 
 
-def _write_jsonl(path: Path, rows: list[object]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
+def _write_jsonl(path: Path, rows: list[object], *, encoding: str = "utf-8") -> None:
+    with path.open("w", encoding=encoding, newline="") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -321,6 +327,25 @@ def test_compare_jsonl_vs_jsonl_exact_match_writes_expected_package(tmp_path: Pa
     assert len(matches) == 1
 
 
+def test_compare_jsonl_with_bom_vs_jsonl_exact_match(tmp_path: Path) -> None:
+    left = tmp_path / "left.jsonl"
+    right = tmp_path / "right.jsonl"
+    output_dir = tmp_path / "comparison"
+    record = _minimal_record(process="ProcessΩ", message="Tweede regel β")
+    _write_jsonl(left, [record], encoding="utf-8-sig")
+    _write_jsonl(right, [record])
+
+    assert main(
+        _compare_args(left, right, output_dir=output_dir, left_format="jsonl", right_format="jsonl")
+    ) == 0
+
+    paths = _assert_expected_package_exists(output_dir)
+    matches = _read_csv_rows(paths["comparison_matches.csv"])
+    assert len(matches) == 1
+    assert matches[0]["process"] == "ProcessΩ"
+    assert matches[0]["message"] == "Tweede regel β"
+
+
 def test_compare_csv_vs_jsonl_exact_match(tmp_path: Path) -> None:
     left = tmp_path / "left.csv"
     right = tmp_path / "right.jsonl"
@@ -334,6 +359,26 @@ def test_compare_csv_vs_jsonl_exact_match(tmp_path: Path) -> None:
 
     paths = _assert_expected_package_exists(output_dir)
     assert len(_read_csv_rows(paths["comparison_matches.csv"])) == 1
+
+
+def test_compare_csv_with_bom_vs_jsonl_exact_match(tmp_path: Path) -> None:
+    left = tmp_path / "left.csv"
+    right = tmp_path / "right.jsonl"
+    output_dir = tmp_path / "comparison"
+    record = _minimal_record(process="ProcessΩ", message="Device β")
+    _write_csv(left, [record], encoding="utf-8-sig")
+    _write_jsonl(right, [record])
+
+    assert main(
+        _compare_args(left, right, output_dir=output_dir, right_format="jsonl")
+    ) == 0
+
+    paths = _assert_expected_package_exists(output_dir)
+    matches = _read_csv_rows(paths["comparison_matches.csv"])
+    assert len(matches) == 1
+    assert matches[0]["match_classification"] == "EXACT_MATCH"
+    assert matches[0]["process"] == "ProcessΩ"
+    assert matches[0]["message"] == "Device β"
 
 
 def test_compare_treats_missing_required_row_value_as_invalid(tmp_path: Path) -> None:
@@ -844,6 +889,7 @@ def test_compare_downloads_uses_directory_level_collision_naming(
     _write_csv(left, [_minimal_record()])
     _write_csv(right, [_minimal_record()])
     monkeypatch.setattr(forensic.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     date_part = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     first_dir = tmp_path / "Downloads" / f"UALExtractor_compare_left_right_{date_part}"
     first_dir.mkdir(parents=True)

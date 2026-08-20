@@ -97,7 +97,7 @@ def validate_output_provenance(
     if output_format == "jsonl":
         component_ok = True
         source_trace_path_ok = True
-        with output_path.open("r", encoding="utf-8") as handle:
+        with output_path.open("r", encoding="utf-8-sig") as handle:
             for raw_line in handle:
                 line = raw_line.strip()
                 if not line:

@@ -5,7 +5,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from pathlib import Path, PosixPath
+from pathlib import Path
 
 import pytest
 
@@ -91,6 +91,7 @@ def test_auto_output_paths_share_same_descriptor_rules_between_dry_run_and_norma
     import ualextractor.forensic as forensic
 
     monkeypatch.setattr(forensic.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr(forensic, "datetime", _FrozenDateTime)
 
     spec = FilterSpec.from_cli(message=["bluetooth"], contains=["wifi"])
@@ -107,9 +108,8 @@ def test_auto_output_paths_share_same_descriptor_rules_between_dry_run_and_norma
 def test_get_user_downloads_dir_uses_windows_profile(monkeypatch, tmp_path):
     import ualextractor.forensic as forensic
 
-    monkeypatch.setattr(forensic, "Path", PosixPath)
-    monkeypatch.setattr(forensic.os, "name", "nt")
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(forensic.Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.delenv("HOME", raising=False)
 
     assert get_user_downloads_dir() == tmp_path / "Downloads"
@@ -237,6 +237,7 @@ def test_auto_output_paths_uses_extraction_directory_layout(tmp_path: Path, monk
     import ualextractor.forensic as forensic
 
     monkeypatch.setattr(forensic.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr(forensic, "datetime", _FrozenDateTime)
 
     output_path, report_path = auto_output_paths(
@@ -255,6 +256,7 @@ def test_downloads_auto_naming_and_collision(tmp_path: Path, monkeypatch):
     import ualextractor.forensic as forensic
 
     monkeypatch.setattr(forensic.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr(forensic, "datetime", _FrozenDateTime)
 
     # synthetic dataset
@@ -319,17 +321,17 @@ def test_downloads_auto_naming_and_collision(tmp_path: Path, monkeypatch):
 
 def test_validate_output_provenance_passes_for_complete_jsonl(tmp_path: Path) -> None:
     output = tmp_path / "out.jsonl"
-    output.write_text(
-        json.dumps(
-            {
-                "message": "bluetooth",
-                "component": "Persist",
-                "source_trace_path": "/tmp/persist.tracev3",
-            }
+    with output.open("w", encoding="utf-8-sig", newline="") as handle:
+        handle.write(
+           json.dumps(
+               {
+                   "message": "bluetooth",
+                   "component": "Persist",
+                   "source_trace_path": "/tmp/persist.tracev3",
+               }
+           )
+           + "\n"
         )
-        + "\n",
-        encoding="utf-8",
-    )
 
     result = validate_output_provenance(output, "jsonl")
 
@@ -654,6 +656,7 @@ def test_downloads_access_denied_fails_before_decoder_starts(
         return _make_process([])
 
     monkeypatch.setattr(forensic.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr(forensic, "datetime", _FrozenDateTime)
     monkeypatch.setattr(forensic.Path, "mkdir", fake_mkdir)
     monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)
@@ -702,6 +705,7 @@ def test_downloads_unwritable_fails_before_decoder_starts_and_cleans_up(
         return _make_process([])
 
     monkeypatch.setattr(forensic.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setattr(forensic, "datetime", _FrozenDateTime)
     monkeypatch.setattr(forensic.Path, "open", fake_open)
     monkeypatch.setattr("ualextractor.decoder.subprocess.Popen", popen)

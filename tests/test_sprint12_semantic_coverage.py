@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
+import pytest
+
 from ualextractor.compare_output import InputFileMetadata
+from ualextractor.compare_semantic import normalize_process_basename
 from ualextractor.compare_semantic_sqlite import run_semantic_coverage_sqlite
 from ualextractor.main import main
 
@@ -23,10 +27,28 @@ def _record(**overrides: object) -> dict[str, object]:
     return row
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
+def _write_jsonl(path: Path, rows: list[dict[str, object]], *, encoding: str = "utf-8") -> None:
+    with path.open("w", encoding=encoding, newline="") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _write_csv(path: Path, rows: list[dict[str, object]], *, encoding: str = "utf-8") -> None:
+    fieldnames = [
+        "timestamp",
+        "process",
+        "pid",
+        "subsystem",
+        "category",
+        "event_type",
+        "log_type",
+        "message",
+    ]
+    with path.open("w", encoding=encoding, newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def _meta(path: Path) -> InputFileMetadata:
@@ -237,6 +259,98 @@ def test_existing_sprint11_compare_command_behavior_remains_available(tmp_path: 
     )
     assert exit_code == 0
     assert (output / "comparison_summary.txt").exists()
+
+
+def test_semantic_coverage_accepts_bom_csv_reference(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.csv"
+    ual = tmp_path / "ual.jsonl"
+    _write_csv(
+        reference,
+        [_record(process="ProcessΩ", message="Device β")],
+        encoding="utf-8-sig",
+    )
+    _write_jsonl(ual, [_record(process="ProcessΩ", message="Device β")])
+
+    result = run_semantic_coverage_sqlite(
+        reference_input=_meta(reference),
+        ualextractor_input=_meta(ual),
+        reference_format_override="csv",
+        ualextractor_format_override="jsonl",
+        sqlite_db_path=tmp_path / "bom-semantic.sqlite3",
+    )
+    assert result.pass_semantic_coverage is True
+    assert result.covered_reference_occurrences == 1
+    assert result.missing_reference_occurrences == 0
+    assert result.reference_invalid_records == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("C:\\Program Files\\App\\proc.exe", "proc.exe"),
+        (r"C:/Program Files/App/proc.exe", "proc.exe"),
+        ("/usr/local/bin/proc", "proc"),
+        ("proc.exe", "proc.exe"),
+        ("proc", "proc"),
+        ("例\\proc.exe", "proc.exe"),
+        ("例/proc.exe", "proc.exe"),
+    ],
+)
+def test_semantic_process_basename_normalization_is_cross_platform_and_deterministic(
+    value: str, expected: str
+) -> None:
+    assert normalize_process_basename(value) == expected
+
+
+def test_semantic_compare_matches_windows_absolute_and_bare_process_names(tmp_path: Path) -> None:
+    _, _, result = _run_sqlite(
+        tmp_path,
+        reference_rows=[
+            _record(process="C:\\Program Files\\App\\proc.exe", message="Hallo β"),
+            _record(process="proc.exe", message="Tweede regel"),
+        ],
+        ual_rows=[
+            _record(process="proc.exe", message="Hallo β"),
+            _record(process="C:\\Somewhere\\proc.exe", message="Tweede regel"),
+            _record(process="other.exe", message="extra UAL record"),
+        ],
+    )
+    assert result.reference_records == 2
+    assert result.reference_invalid_records == 0
+    assert result.ualextractor_records == 3
+    assert result.ualextractor_invalid_records == 0
+    assert result.strict_semantic_matches == 2
+    assert result.missing_reference_occurrences == 0
+    assert result.coverage_percentage == 100.0
+    assert result.pass_semantic_coverage is True
+
+
+def test_semantic_coverage_accepts_bom_jsonl_reference_and_ual(tmp_path: Path) -> None:
+    reference = tmp_path / "reference.jsonl"
+    ual = tmp_path / "ual.jsonl"
+    _write_jsonl(
+        reference,
+        [_record(process="proc.exe", message="Hallo β")],
+        encoding="utf-8-sig",
+    )
+    _write_jsonl(
+        ual,
+        [_record(process=r"C:\\Somewhere\\proc.exe", message="Hallo β")],
+        encoding="utf-8-sig",
+    )
+
+    result = run_semantic_coverage_sqlite(
+        reference_input=_meta(reference),
+        ualextractor_input=_meta(ual),
+        reference_format_override="jsonl",
+        ualextractor_format_override="jsonl",
+        sqlite_db_path=tmp_path / "bom-jsonl-semantic.sqlite3",
+    )
+    assert result.pass_semantic_coverage is True
+    assert result.covered_reference_occurrences == 1
+    assert result.missing_reference_occurrences == 0
+    assert result.reference_invalid_records == 0
+    assert result.ualextractor_invalid_records == 0
 
 
 def test_context_present_message_difference_is_reported_without_becoming_strict_match(tmp_path: Path) -> None:
